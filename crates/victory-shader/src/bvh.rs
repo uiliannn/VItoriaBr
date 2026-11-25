@@ -196,8 +196,8 @@ pub fn boxes(children: &[u32; 4], boxes: &[[f32; 6]; 4], ray: &Ray, sort: bool) 
         }
         let enter = near[0].max(near[1]).max(near[2]);
         let leave = far[0].min(far[1]).min(far[2]);
-        // A box whose minimum x is NaN is switched off.
-        if !b[0].is_nan() && leave >= enter.max(0.0) && enter < ray.extent {
+        // An absent child or a box whose minimum x is NaN is switched off.
+        if children[n] != NONE && !b[0].is_nan() && leave >= enter.max(0.0) && enter < ray.extent {
             ids[n] = children[n];
             distances[n] = enter;
         }
@@ -475,6 +475,24 @@ pub(crate) mod tests {
         let ray = Ray::new([-5.0, 0.0, 0.0], [1.0, 0.0, 0.0], 100.0);
         // Child 1 is hit but is not there: its pointer is what "none" is.
         assert_eq!(intersect(&node, 5, &ray, true), [8, NONE, NONE, NONE]);
+    }
+
+    #[test]
+    fn a_missing_child_with_a_finite_box_does_not_sort_ahead_of_hits() {
+        let boxes = [
+            [0.0; 6],
+            moved(UNIT, [20.0, 0.0, 0.0]),
+            UNIT,
+            moved(UNIT, [10.0, 0.0, 0.0]),
+        ];
+        let children = [NONE, 16, NONE, 32];
+        let ray = Ray::new([-5.0, 0.0, 0.0], [1.0, 0.0, 0.0], 100.0);
+        let wide = box32(children, boxes);
+        let half = box16(children, boxes);
+        assert_eq!(intersect(&wide, 5, &ray, true), [32, 16, NONE, NONE]);
+        assert_eq!(intersect(&half, 4, &ray, true), [32, 16, NONE, NONE]);
+        assert_eq!(intersect(&wide, 5, &ray, false), [NONE, 16, NONE, 32]);
+        assert_eq!(intersect(&half, 4, &ray, false), [NONE, 16, NONE, 32]);
     }
 
     #[test]

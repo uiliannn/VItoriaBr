@@ -421,9 +421,23 @@ fn scene() -> (Scene, Vec<Vec<Case>>) {
             }
         }
     }
+    // Absent children (`NONE`) with closer finite or zeroed bounds in front of
+    // valid children, so sorted hits cannot place `NONE` ahead of valid ids.
+    let absent_boxes = [
+        [0.0; 6],
+        moved(UNIT, [20.0, 0.0, 0.0]),
+        UNIT,
+        moved(UNIT, [10.0, 0.0, 0.0]),
+    ];
+    let absent_ids = [bvh::NONE, 16, bvh::NONE, 32];
+    let absent32 = s.add(nodes::box32(absent_ids, absent_boxes), 32);
+    let absent16 = s.add(nodes::box16(absent_ids, absent_boxes), 16);
+    let absent_ray = Ray::new([-5.0, 0.0, 0.0], [1.0, 0.0, 0.0], 100.0);
     // Kinds the instruction does not read, and threads masked out.
     let ray = Ray::new([0.0; 3], [0.0, 0.0, 1.0], 100.0);
     cases.extend([
+        Some((absent32, 5, absent_ray)),
+        Some((absent16, 4, absent_ray)),
         Some((triangle_nodes[0].0, 6, ray)),
         Some((triangle_nodes[0].0, 7, ray)),
         None,
