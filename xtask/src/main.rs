@@ -1,5 +1,6 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
+mod env;
 mod policy;
 
 use std::path::{Path, PathBuf};
@@ -26,12 +27,19 @@ enum Cmd {
     },
     /// Point git at .githooks/ so every commit runs the policy check.
     InstallHooks,
+    /// Regenerate docs/env.md, the table of `VICTORY_*` switches.
+    Env {
+        /// Only check that docs/env.md is current.
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 fn main() -> Result<()> {
     let root = workspace_root();
     match Cli::parse().command {
         Cmd::Policy { staged } => policy::run(&root, staged),
+        Cmd::Env { check } => env::run(&root, check),
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])

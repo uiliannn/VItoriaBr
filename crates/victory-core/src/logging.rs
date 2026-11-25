@@ -32,4 +32,7 @@ pub fn init(default_level: &str) {
                 .with_writer(std::io::stderr),
         )
         .try_init();
+    for name in crate::switches::unread(std::env::vars_os()) {
+        eprintln!("warning: {name} is set but is no known switch (docs/env.md): a typo?");
+    }
 }
