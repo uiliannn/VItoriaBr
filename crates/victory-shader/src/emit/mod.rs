@@ -1979,6 +1979,7 @@ mod lds_bounds_tests {
         w.push(S_ENDPGM);
 
         let cs = compile_lds_cs(&w, false, 24, 1, [64, 1, 1]).unwrap();
+        let _ = &cs;
         #[cfg(windows)]
         {
             let _one = super::valu_tests::ONE_AT_A_TIME
@@ -2075,6 +2076,7 @@ mod lds_bounds_tests {
         w.push(S_ENDPGM);
 
         let cs = compile_lds_cs(&w, false, 10, 1, [64, 1, 1]).unwrap();
+        let _ = &cs;
         #[cfg(windows)]
         {
             let _one = super::valu_tests::ONE_AT_A_TIME
@@ -2186,6 +2188,7 @@ mod lds_bounds_tests {
         // explicit WaveSize(32) PSOs, so execute on hardware GPU when present
         // (`compile_lds_cs` already validates the container with `dxil.dll`).
         let cs = compile_lds_cs(&w, true, 6, 1, [64, 1, 1]).unwrap();
+        let _ = &cs;
         #[cfg(windows)]
         {
             let _one = super::valu_tests::ONE_AT_A_TIME

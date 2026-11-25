@@ -752,10 +752,14 @@ void main() {
         event: HANDLE,
         clamp: Clamp,
         worker: Clamp,
+        _serial: std::sync::MutexGuard<'static, ()>,
     }
 
     impl WarpHarness {
         fn new() -> Option<Self> {
+            let serial = crate::host::WARP_SERIAL
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             // SAFETY: plain DXGI WARP query and D3D12 test harness setup.
             unsafe {
                 let factory: IDXGIFactory4 =
@@ -794,6 +798,7 @@ void main() {
                     event,
                     clamp,
                     worker,
+                    _serial: serial,
                 })
             }
         }
@@ -1531,13 +1536,12 @@ void main() {
         );
         assert_eq!(after_src, initial_src, "src_args must remain untouched");
 
-        let mut kept = 0usize;
+        let mut kept = Vec::new();
         let mut zeroed = 0usize;
         for i in 0..RECORDS as usize {
             let rec = &out_words[i * 6..(i + 1) * 6];
             if rec[0] == (1 << 22) && rec[1] == 16 {
-                assert!(i == 1 || i == 2, "the first two real draws fit the budget");
-                kept += 1;
+                kept.push(i);
             } else {
                 assert_eq!((rec[0], rec[1]), (0, 0), "excess draw must be zeroed");
                 zeroed += 1;
@@ -1547,7 +1551,14 @@ void main() {
             assert_eq!(rec[4], 5000 + i as u32);
             assert_eq!(rec[5], 0xCAFE_0000 | (i as u32));
         }
-        assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
+        // Two groups of 64 race for the single budget word: whichever group
+        // reaches the CAS first fits its first two real draws in lane order
+        // (1 and 2 for group 0 since slot 0 is empty, or 64 and 65 for group 1).
+        assert!(
+            kept == [1, 2] || kept == [64, 65],
+            "the winning group's first two real draws must fit in lane order, got {kept:?}"
+        );
+        assert_eq!(zeroed, (RECORDS as usize) - 2);
     }
 
     /// Exercises `HostList::indirect_scratch`, `bound`, the scratch buffer's

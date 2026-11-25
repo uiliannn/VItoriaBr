@@ -717,6 +717,12 @@ fn create() -> windows::core::Result<Host> {
     }
 }
 
+/// Serializes unit tests that open the singleton `EnumWarpAdapter()` D3D12
+/// device so `d3d10warp.dll` does not race across concurrent `VirtualFree`,
+/// `OpenExistingHeapFromAddress`, and queue/PSO teardown calls.
+#[cfg(test)]
+pub(crate) static WARP_SERIAL: Mutex<()> = Mutex::new(());
+
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
 pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
@@ -3725,6 +3731,7 @@ impl Host {
     /// Whether the device runs on a software adapter (WARP) or no DXGI adapter
     /// handle was retained (e.g. headless CI WARP runners).
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn is_software_adapter(&self) -> bool {
         self.adapter.as_ref().is_none_or(|a| {
             // SAFETY: live DXGI adapter.
