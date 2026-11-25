@@ -20,6 +20,8 @@ use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
+mod gpu_detile;
+
 use crate::host::{HostList, host};
 use crate::object::This;
 
@@ -34,6 +36,7 @@ macro_rules! once {
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
     buffer: ID3D12Resource,
+    gpu_detile: Option<gpu_detile::GpuDetile>,
     /// Its bytes.
     #[cfg(feature = "diagnostics")]
     size: u64,
@@ -741,6 +744,9 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     crate::framelog::add(crate::framelog::T::Uploads, 1);
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
+    if staging.gpu_detile.is_some() {
+        list.defer_gpu_detile(staging.clone());
+    }
     // The staging buffer lives as long as `staging`, which the deferred
     // refresh below holds until the list is reset.
     for (i, footprint) in staging.footprints.iter().enumerate() {
@@ -789,6 +795,17 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         };
         // SAFETY: an open list; both locations name live resources.
         unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+    }
+    if staging.gpu_detile.is_some() {
+        // SAFETY: the copies promoted the prelude's buffer to COPY_SOURCE.
+        // The next list's prelude starts from COMMON again.
+        unsafe {
+            list.list.ResourceBarrier(&[crate::host::transition(
+                &staging.buffer,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_COMMON,
+            )]);
+        }
     }
     // When the list is submitted, its copy takes what the staging buffer
     // holds by then: noted before the check below, which sets `dirty`
@@ -939,6 +956,13 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
 }
 
 impl Staging {
+    /// Records the GPU conversion for a texture this list will upload.
+    pub(crate) fn record_gpu_detile(&self, list: &ID3D12GraphicsCommandList) {
+        if let Some(gpu_detile) = &self.gpu_detile {
+            gpu_detile.record(list);
+        }
+    }
+
     /// Levels on demand: what says, beside the mapping, which levels of
     /// the texture are the title's now. First the lowest level a live view
     /// of the texture shows (0 without a view that says): the title's own
@@ -1184,6 +1208,10 @@ impl Staging {
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(gpu_detile) = &self.gpu_detile {
+            gpu_detile.fill(tiled);
+            return;
+        }
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
         // that gives levels their memory goes by this answer.
@@ -1298,6 +1326,13 @@ pub(crate) fn is_staged(resource: This) -> bool {
     map.as_ref().is_some_and(|map| map.contains_key(&(resource as usize)))
 }
 
+#[cfg(test)]
+pub(crate) fn uses_gpu_detile(resource: This) -> bool {
+    STAGING.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+        .and_then(|map| map.get(&(resource as usize)))
+        .is_some_and(|staging| staging.gpu_detile.is_some())
+}
+
 /// The bytes of a title texture's memory, and whether all of it is mapped,
 /// if the texture has been staged for upload.
 pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
@@ -1400,23 +1435,20 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
     true
 }
 
-/// How many bytes of `[at, at + len)` are committed memory: all of a
-/// texture that is there, some of one streaming in (its smaller mips lie
-/// at the start of its memory, and their pages are mapped first), none of
-/// one not there. With neither the first nor the last page committed the
-/// answer is none without a look at the pages between (two queries for the
-/// slots whose texture is away, which are asked again and again).
+/// How many bytes of `[at, at + len)` are backed by readable memory.
+/// The fast path samples console pages. If both ends are absent, walk the
+/// virtual-memory regions to distinguish an absent texture from readable
+/// mip data in the middle.
 pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
-    if len == 0 {
-        return 0;
-    }
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
     let start = at as usize;
     let end = start.saturating_add(len);
-    if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
+    if start >= end {
         return 0;
     }
-    if !by_query() {
+    if !by_query() && (committed(at, 1) || committed((end - 1) as *const u8, 1)) {
         static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *BY_PAGE.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_PAGE").is_some_and(|v| v == "1")) {
             // By page, without the walk: whole pages, cut to the range.
@@ -1453,7 +1485,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         if n == 0 || next <= p {
             break;
         }
-        if info.State == MEM_COMMIT {
+        if info.State == MEM_COMMIT && info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 {
             there += (next - p) as u64;
         }
         p = next;
@@ -1508,18 +1540,40 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let (buffer, data, pooled) = staging_buffer(host, total)?;
+    let writable = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0
+        | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0
+        | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0;
+    let gpu_detile = if gpu_detile::enabled()
+        && !on_demand
+        && d.Flags.0 & writable == 0
+        && d.SampleDesc.Count == 1
+        && layout.size >= 1 << 20
+    {
+        gpu_detile::GpuDetile::new(host, &layout, &footprints, &rows, total)
+    } else {
+        None
+    };
+    let (buffer, data, pooled) = if let Some(conversion) = &gpu_detile {
+        for footprint in &mut footprints {
+            footprint.Offset += conversion.linear_base;
+        }
+        (conversion.scratch.clone(), std::ptr::null_mut(), 0)
+    } else {
+        staging_buffer(host, total)?
+    };
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
             d.Width, d.Height, d.DepthOrArraySize, d.Format.0
         )
     });
-    tracing::debug!(?desc, total, "texture contents uploaded from title memory");
+    tracing::debug!(?desc, total, gpu_detile = gpu_detile.is_some(), "texture contents uploaded from title memory");
+    let staged_bytes = gpu_detile.as_ref().map_or(total, gpu_detile::GpuDetile::bytes);
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+    STAGED[1].fetch_add(staged_bytes, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
         buffer,
+        gpu_detile,
         #[cfg(feature = "diagnostics")]
         size: total,
         data,
@@ -1527,7 +1581,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         rows,
         layout,
         mips: u32::from(d.MipLevels),
-        bytes: total,
+        bytes: staged_bytes,
         memory,
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
@@ -1545,7 +1599,33 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 
 #[cfg(test)]
 mod title_memory_tests {
-    use super::with_title;
+    use super::{mapped_bytes, with_title};
+
+    #[test]
+    fn a_streamed_mip_can_be_mapped_between_two_unmapped_ends() {
+        use windows_sys::Win32::System::Memory::*;
+        const MIP: usize = 64 << 10;
+        const SIZE: usize = 4 * MIP;
+        // SAFETY: a private reservation; only the committed middle is written.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            assert_eq!(mapped_bytes(base, SIZE), 0);
+            let middle = base.add(MIP);
+            assert_eq!(VirtualAlloc(middle.cast(), MIP, MEM_COMMIT, PAGE_READWRITE), middle.cast());
+            let hidden = base.add(2 * MIP);
+            assert_eq!(VirtualAlloc(hidden.cast(), MIP, MEM_COMMIT, PAGE_NOACCESS), hidden.cast());
+            middle.write_bytes(0xb6, MIP);
+            let available = mapped_bytes(base, SIZE);
+            with_title(base, SIZE, |bytes| {
+                assert!(bytes[..MIP].iter().all(|&b| b == 0));
+                assert!(bytes[MIP..2 * MIP].iter().all(|&b| b == 0xb6));
+                assert!(bytes[2 * MIP..].iter().all(|&b| b == 0));
+            });
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+            assert_eq!(available, MIP as u64);
+        }
+    }
 
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does

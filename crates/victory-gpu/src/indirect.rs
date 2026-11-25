@@ -69,21 +69,29 @@ static const uint GROUPS = 1u << 20;
 // round for each record of a window, and in memory the CPU maps (where the
 // budget was, and is with VICTORY_INDIRECT_CARD_BUDGET=0) every atomic
 // crosses the bus on a card of its own.
+#ifndef SINGLE_RECORD
 groupshared uint costs[64];
 groupshared uint fits[64];
 groupshared uint largest_asked;
 groupshared uint all_asked;
+#endif
 [RootSignature(RS)]
+#ifdef SINGLE_RECORD
+[numthreads(1, 1, 1)]
+#else
 [numthreads(64, 1, 1)]
+#endif
 void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     uint eff_count = records;
     bool ahead = (has_count & 2u) != 0;
     if ((has_count & 1u) != 0) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
     }
-    // Threads past the records take part in the group's charge (cost 0)
-    // and store nothing.
+    // Only the multi-record kernel needs inactive lanes at its barriers.
     bool active = id.x < eff_count;
+#ifdef SINGLE_RECORD
+    if (!active) return;
+#endif
     uint src_at = args_offset + id.x * stride;
     // (A branch, not a select: without the bit the view behind `count_buf`
     // is a count of four bytes, or the source itself, and is not read here.)
@@ -96,10 +104,12 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     uint asked = 0;
     uint2 draw_counts = uint2(0, 0);
     uint3 groups = uint3(0, 0, 0);
+#ifndef SINGLE_RECORD
     if (gi == 0) {
         largest_asked = 0;
         all_asked = 0;
     }
+#endif
     if (active && kind <= 1) {
         // Draws: vertex or index count, then instances.
         uint2 want = src_args.Load2(src_at);
@@ -147,6 +157,27 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         cost = g.x * g.y * g.z * 128u;
         groups = g;
     }
+#ifdef SINGLE_RECORD
+    bool over = false;
+    if (cost != 0) {
+        uint before;
+        budget.InterlockedOr(0, 0, before);
+        [allow_uav_condition]
+        while (before < BUDGET) {
+            uint next = min(BUDGET - before, cost) + before;
+            uint prev;
+            budget.InterlockedCompareExchange(0, before, next, prev);
+            if (prev == before) break;
+            before = prev;
+        }
+        over = before >= BUDGET || BUDGET - before < cost;
+    }
+    if (kind > 2) {
+        uint was;
+        budget.InterlockedMax(4, asked, was);
+        budget.InterlockedAdd(8, min(asked, 1u << 24), was);
+    }
+#else
     costs[gi] = cost;
     GroupMemoryBarrierWithGroupSync();
     if (active && kind > 2) {
@@ -204,6 +235,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         return;
     }
     bool over = fits[gi] == 0;
+#endif
     if (kind <= 1) {
         if (over) {
             draw_counts = uint2(0, 0);
@@ -254,6 +286,32 @@ fn make() -> windows::core::Result<Clamp> {
 
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
     make_from(device, SOURCE)
+}
+
+fn make_single(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+    make_from(device, &format!("#define SINGLE_RECORD\n{SOURCE}"))
+}
+
+/// Opt-in specialization for the indirect calls that still clamp by themselves.
+fn clamp_for(records: u32) -> Option<&'static Clamp> {
+    static SINGLE: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    if records == 1
+        && let Some(single) = SINGLE.get_or_init(|| {
+            if std::env::var_os("VICTORY_INDIRECT_SINGLE").is_none_or(|v| v != "1") {
+                return None;
+            }
+            match make_single(&host()?.device) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!(error = %e, "single-record argument clamp unavailable");
+                    None
+                }
+            }
+        })
+    {
+        return Some(single);
+    }
+    clamp()
 }
 
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
@@ -350,7 +408,7 @@ pub(crate) fn bound(
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    let (c, budget, dst) = (clamp_for(spec.2)?, list.budget()?, list.indirect_scratch(bytes)?);
     clamp_into(list, c, &dst, budget, src, count, spec, false).then_some(dst)
 }
 
@@ -370,7 +428,7 @@ pub(crate) fn bound_ahead(
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    let (c, budget, dst) = (clamp_for(spec.2)?, list.budget()?, list.indirect_scratch(bytes)?);
     clamp_into(list, c, &dst, budget, src, None, spec, true).then_some(dst)
 }
 
@@ -1748,11 +1806,86 @@ void main() {
         assert_ne!(clamped_words[21], 0xDEAD_BEEF);
     }
 
-    /// WARP D3D12 test proving `BUDGET` saturates without 32-bit unsigned
-    /// wraparound across >64 huge indexed-draw records (`count = None`), while
-    /// preserving `StartIndexLocation`, `BaseVertexLocation`,
-    /// `StartInstanceLocation`, and custom stride padding, and leaving
-    /// `src_args` untouched.
+    #[test]
+    fn warp_single_record_matches_the_group_clamp() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let single = make_single(&warp.device).expect("single-record clamp must compile on WARP");
+        const STRIDE: u32 = 32;
+        const BUDGET: u32 = 1 << 27;
+        // Include padding, a nonzero source/count offset, and both sides of
+        // exact budget exhaustion. A zero count must leave scratch untouched.
+        let cases = [
+            (0, [3, 2, 17], None, 0, false),
+            (1, [9, 4, u32::MAX], Some(3), BUDGET - 36, false),
+            (1, [9, 4, u32::MAX], None, BUDGET - 35, false),
+            (2, [u32::MAX, 32, 1], Some(1), 0, false),
+            (2, [7, 1, 1], Some(0), 42, false),
+            (10, [u32::MAX, 5, 2], None, 0, false),
+            (10, [u32::MAX, 5, 2], None, 0, true),
+            (10, [0, 1, 1], None, BUDGET, false),
+            (10, [1, 1, 1], None, BUDGET, false),
+        ];
+        let (src, src_ptr, _) = warp.shared_buffer(64);
+        let (count, count_ptr, _) = warp.shared_buffer(8);
+        let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (back, back_ptr, _) = warp.shared_buffer(u64::from(STRIDE));
+        let group = Clamp { root: warp.clamp.root.clone(), pso: warp.clamp.pso.clone() };
+        for (kind, args, count_value, spent, ahead) in cases {
+            let mut outcomes = Vec::new();
+            for clamp in [&group, &single] {
+                let dst = warp.default_uav(u64::from(STRIDE));
+                let record = [args[0], args[1], args[2], 4, 5, 6, 7, 8];
+                // SAFETY: CPU writes to mapped buffers after the previous
+                // submission completed. The full record starts at byte 32.
+                unsafe {
+                    src_ptr.add(32).cast::<[u32; 8]>().write(record);
+                    count_ptr.add(4).cast::<u32>().write(count_value.unwrap_or(0));
+                    budget_ptr.cast::<[u32; 3]>().write([spent, 17, 19]);
+                    warp.list.ResourceBarrier(&[transition(
+                        &dst,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    )]);
+                    warp.list.CopyBufferRegion(&dst, 0, &src, 32, u64::from(STRIDE));
+                }
+                assert!(record_clamp_as(
+                    clamp,
+                    &warp.list,
+                    (&dst, D3D12_RESOURCE_STATE_COPY_DEST),
+                    budget_gpu,
+                    (&src, 32),
+                    count_value.map(|_| (&count, 4)),
+                    (kind, STRIDE, 1),
+                    ahead,
+                ));
+                // SAFETY: an open list, and the clamp left dst in INDIRECT_ARGUMENT.
+                unsafe {
+                    warp.list.ResourceBarrier(&[transition(
+                        &dst,
+                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                    warp.list.CopyBufferRegion(&back, 0, &dst, 0, u64::from(STRIDE));
+                }
+                warp.submit_and_wait();
+                // SAFETY: the submission ended, and both buffers remain mapped.
+                let outcome = unsafe {
+                    (
+                        budget_ptr.cast::<[u32; 3]>().read(),
+                        back_ptr.cast::<[u32; 8]>().read(),
+                    )
+                };
+                if count_value == Some(0) {
+                    assert_eq!(outcome, ([spent, 17, 19], record));
+                }
+                outcomes.push(outcome);
+            }
+            assert_eq!(outcomes[0], outcomes[1], "{kind} {args:?} {count_value:?} {spent} {ahead}");
+        }
+    }
+
     /// A window of mesh records clamped ahead: the filled ones come out as
     /// they are and are charged, the slots of all ones come out empty and
     /// charge nothing; clamped as single records the same slots are clamped
@@ -1933,6 +2066,8 @@ void main() {
         }
     }
 
+    /// Saturates the budget across more than 64 huge indexed draws while
+    /// preserving the remaining draw arguments and custom stride padding.
     #[test]
     fn warp_budget_saturates_without_wraparound_and_preserves_draw_fields() {
         let Some(mut warp) = WarpHarness::new() else {

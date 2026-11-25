@@ -33,11 +33,9 @@
 //! - The small levels the card packs into shared tiles are given together
 //!   when any of them is held; the upload writes all of them (zeros for
 //!   the ones not held).
-//! - A shader must not reach a level without memory (it reads zeros: a
-//!   black texture). The host view of a slot is made from the first level
-//!   that is held and has tiles ([`show_from`], `descriptor/host.rs`
-//!   `make`), and the slots of a texture are made again when that level
-//!   changes (`HostHeap::texture_views_remade`).
+//! - A shader view selects a contiguous mip range with initialized tiles
+//!   ([`show_resident`], `descriptor/host.rs` `make`). The texture's slots
+//!   are made again when its resident levels change.
 //! - shortcut: tiles are not taken back while the host copy lives. A level
 //!   the title lets go of, or that turns out to be the next texture's,
 //!   keeps its tiles; it is hidden by the views and written with zeros at
@@ -247,6 +245,16 @@ struct Given {
     runs: Vec<(usize, u32, u32)>,
 }
 
+/// One reserved texture can map several mip regions to the same heap in
+/// one queue call. Heap ranges follow the corresponding regions in order.
+struct TileMappings {
+    heap: ID3D12Heap,
+    coordinates: Vec<D3D12_TILED_RESOURCE_COORDINATE>,
+    sizes: Vec<D3D12_TILE_REGION_SIZE>,
+    starts: Vec<u32>,
+    counts: Vec<u32>,
+}
+
 /// A host texture made without memory, and the tiles its levels have been
 /// given.
 pub(crate) struct Tiled {
@@ -260,9 +268,7 @@ pub(crate) struct Tiled {
     /// The bytes all its tiles would take.
     pub(crate) full: u64,
     given: Mutex<Given>,
-    /// The first level a view of the texture may show: the first one that
-    /// is held or was written by the card and has tiles (`u32::MAX`: none
-    /// yet).
+    /// Levels that are held or were written by the card and have tiles.
     shown: AtomicU32,
     /// The levels held at the last upload (a bit a level).
     held: AtomicU32,
@@ -333,7 +339,7 @@ impl Tiled {
             packed: packed_tiles,
             levels,
             full,
-            shown: AtomicU32::new(u32::MAX),
+            shown: AtomicU32::new(0),
             held: AtomicU32::new(0),
             card: AtomicU32::new(0),
             claimed: AtomicU32::new(0),
@@ -351,7 +357,7 @@ impl Tiled {
     /// card's gate in `draw.rs` on the ground that it takes no memory;
     /// with tiles given here regardless, the line would not bound these
     /// textures.)
-    /// Returns whether the first level a view may show changed, and
+    /// Returns whether the levels a view may show changed, and
     /// whether a level named is still without tiles (no room, or no heap
     /// could be had): the caller has the upload recorded again later, or
     /// the level would stay empty until the title writes the texture.
@@ -386,7 +392,7 @@ impl Tiled {
     /// At the submission of a list in which the card itself writes the
     /// levels `levels` of `texture` (after zeros, if they were new:
     /// [`Tiled::claim`]): tiles for those that have none. Returns whether
-    /// the first level a view may show changed.
+    /// the levels a view may show changed.
     /// Only the levels this list writes get tiles here: a held level that
     /// is waiting for room is written by no copy of this list, and tiles
     /// hold what their last owner left.
@@ -486,13 +492,13 @@ impl Tiled {
     /// name (a bit a level, level 0 the lowest) and that have none yet;
     /// the levels the card packs together get theirs when any of them is
     /// so named. `named`: the levels that are the title's or the card's
-    /// own, by which the first level a view may show is told; `may`: the
+    /// own, which determines the levels a view may show; `may`: the
     /// ones of them that may get tiles in this call. To be called only
     /// from a submission-time step of a list that writes every level of
     /// `may`, whole: the call is ahead of that list on `queue`, and tiles
     /// hold what their last owner left.
-    /// Returns whether the first level a view may show changed
-    /// ([`Tiled::first_shown`]): the caller has the texture's slots made
+    /// Returns whether the levels a view may show changed
+    /// ([`Tiled::shown_levels`]): the caller has the texture's slots made
     /// again.
     #[cfg(test)]
     pub(crate) fn give_on(
@@ -516,7 +522,6 @@ impl Tiled {
         named: u32,
         may: u32,
     ) -> bool {
-        let has = |level: u32| level < 32 && named & (1 << level) != 0;
         let now = |level: u32| level < 32 && named & may & (1 << level) != 0;
         let first_packed = self.standard.len() as u32;
         // (subresource, tiles, the level if it has tiles of its own) to map now.
@@ -529,73 +534,74 @@ impl Tiled {
         if self.packed > 0 && !given.packed && (first_packed..self.levels).any(now) {
             wanted.push((first_packed, self.packed, None));
         }
+        let mut mappings = std::collections::BTreeMap::new();
         for (subresource, tiles, level) in wanted {
             let Some((heap, index, runs)) = take(device, tiles) else {
                 continue;
             };
-            let at = D3D12_TILED_RESOURCE_COORDINATE {
+            let mapping = mappings.entry(index).or_insert_with(|| TileMappings {
+                heap,
+                coordinates: Vec::new(),
+                sizes: Vec::new(),
+                starts: Vec::new(),
+                counts: Vec::new(),
+            });
+            mapping.coordinates.push(D3D12_TILED_RESOURCE_COORDINATE {
                 X: 0,
                 Y: 0,
                 Z: 0,
                 Subresource: subresource,
-            };
-            let size = D3D12_TILE_REGION_SIZE {
+            });
+            mapping.sizes.push(D3D12_TILE_REGION_SIZE {
                 NumTiles: tiles,
                 ..Default::default()
-            };
-            // One region, the subresource's tiles in order, on as many
-            // ranges of the heap as the runs taken.
-            let flags = vec![D3D12_TILE_RANGE_FLAG_NONE; runs.len()];
-            let starts: Vec<u32> = runs.iter().map(|run| run.0).collect();
-            let counts: Vec<u32> = runs.iter().map(|run| run.1).collect();
+            });
+            for (start, count) in runs {
+                mapping.starts.push(start);
+                mapping.counts.push(count);
+                given.runs.push((index, start, count));
+            }
+            match level {
+                Some(level) => given.levels[level] = true,
+                None => given.packed = true,
+            }
+            STATS[2].fetch_add(u64::from(tiles) * TILE, Ordering::Relaxed);
+            STATS[5].fetch_add(1, Ordering::Relaxed);
+        }
+        for mapping in mappings.values() {
             let began = std::time::Instant::now();
-            // SAFETY: a live reserved texture and a live heap of ours; one
-            // region of `tiles` tiles from the subresource's first tile;
-            // `runs.len()` ranges whose counts add up to `tiles`, in three
-            // arrays of that length that live through the call.
+            // SAFETY: live objects and matching coordinate/size and
+            // start/count arrays. Each region's ranges cover exactly its
+            // tile count. Null flags map every range with the normal mode.
             unsafe {
                 queue.UpdateTileMappings(
                     texture,
-                    1,
-                    Some(&raw const at),
-                    Some(&raw const size),
-                    &heap,
-                    runs.len() as u32,
-                    Some(flags.as_ptr()),
-                    Some(starts.as_ptr()),
-                    Some(counts.as_ptr()),
+                    mapping.coordinates.len() as u32,
+                    Some(mapping.coordinates.as_ptr()),
+                    Some(mapping.sizes.as_ptr()),
+                    &mapping.heap,
+                    mapping.starts.len() as u32,
+                    None,
+                    Some(mapping.starts.as_ptr()),
+                    Some(mapping.counts.as_ptr()),
                     D3D12_TILE_MAPPING_FLAG_NONE,
                 );
             }
             STATS[6].fetch_add(1, Ordering::Relaxed);
             STATS[7].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
-            match level {
-                Some(level) => given.levels[level] = true,
-                None => given.packed = true,
-            }
-            for &(start, count) in &runs {
-                given.runs.push((index, start, count));
-            }
-            STATS[2].fetch_add(u64::from(tiles) * TILE, Ordering::Relaxed);
-            STATS[5].fetch_add(1, Ordering::Relaxed);
         }
-        let with_tiles = |level: u32| {
-            if level < first_packed {
-                given.levels[level as usize]
-            } else {
-                given.packed
-            }
-        };
-        let shown = (0..self.levels).find(|&level| has(level) && with_tiles(level)).unwrap_or(u32::MAX);
+        let shown = named & !self.without_locked(given, named);
         self.shown.swap(shown, Ordering::Relaxed) != shown
     }
 
-    /// The first level a view of the texture may show; `None` while no
-    /// level is both held and given (the views are then as the title made
-    /// them, and read zeros).
-    pub(crate) fn first_shown(&self) -> Option<u32> {
-        let shown = self.shown.load(Ordering::Relaxed);
-        (shown != u32::MAX).then_some(shown)
+    pub(crate) fn shown_levels(&self) -> u32 {
+        self.shown.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn first_shown(&self) -> Option<u32> {
+        let shown = self.shown_levels();
+        (shown != 0).then(|| shown.trailing_zeros())
     }
 
     /// Whether level `level` has tiles.
@@ -645,26 +651,39 @@ impl Drop for Tiled {
     }
 }
 
-/// Keeps a two-dimensional shader view (2D or 2D array) from the levels
-/// before `first` of a texture of `levels` levels: it starts at `first` if
-/// it started before it, shows as many levels fewer (clamped to the
-/// remaining levels), and reduces `ResourceMinLODClamp` by the same shift so
-/// the effective minimum LOD stays at the same resource level.
-pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, levels: u32) {
-    if first >= levels {
+/// Restricts a 2D shader view to the first contiguous resident mip run
+/// within its requested range. If the whole range is absent, use the
+/// nearest coarser resident mip, or the coarsest finer one.
+pub(crate) fn show_resident(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, resident: u32, levels: u32) {
+    let levels = levels.min(32);
+    if levels == 0 || resident == 0 {
         return;
     }
+    let resident = resident & (u32::MAX >> (32 - levels));
     let clamp = |most: &mut u32, mips: &mut u32, min_lod: &mut f32| {
-        if first <= *most {
+        if *most >= levels || *mips == 0 || resident == 0 {
             return;
         }
-        let fewer = first - *most;
-        *most = first;
-        if *mips != u32::MAX {
-            *mips = mips.saturating_sub(fewer).clamp(1, levels - first);
+        let end = most.saturating_add(*mips).min(levels);
+        let requested = end - *most;
+        let coarser = resident >> *most;
+        if coarser == 0 {
+            *most = u32::BITS - 1 - resident.leading_zeros();
+            *mips = 1;
+            *min_lod = 0.0;
+            return;
         }
+        let shift = coarser.trailing_zeros();
+        let first = *most + shift;
+        let available = (coarser >> shift).trailing_ones();
+        let count = if first < end { available.min(end - first) } else { 1 };
+        if shift == 0 && count == requested {
+            return;
+        }
+        *most = first;
+        *mips = count;
         if *min_lod > 0.0 {
-            *min_lod = (*min_lod - fewer as f32).max(0.0);
+            *min_lod = (*min_lod - shift as f32).clamp(0.0, (count - 1) as f32);
         }
     };
     match desc.ViewDimension {
@@ -745,9 +764,8 @@ mod tests {
     const SIDE: u32 = 1024;
     const LEVELS: u16 = 11;
 
-    /// Two views of one texture read at the same place and level: the
-    /// first as the layer makes it for a texture whose level 0 has no
-    /// memory, the second as the title asked.
+    /// Two views with the same first mip sample the next level. The first
+    /// view clamps to the resident run, while the legacy view sees the hole.
     const LOOK: &str = r#"
 #define RS "DescriptorTable(SRV(t0, numDescriptors = 2)), UAV(u0), StaticSampler(s0, filter = FILTER_MIN_MAG_MIP_POINT)"
 Texture2D<float4> clamped : register(t0);
@@ -757,8 +775,8 @@ RWByteAddressBuffer words : register(u0);
 [RootSignature(RS)]
 [numthreads(1, 1, 1)]
 void look() {
-    float4 a = clamped.SampleLevel(nearest, float2(0.3, 0.3), 0);
-    float4 b = whole.SampleLevel(nearest, float2(0.3, 0.3), 0);
+    float4 a = clamped.SampleLevel(nearest, float2(0.3, 0.3), 1);
+    float4 b = whole.SampleLevel(nearest, float2(0.3, 0.3), 1);
     words.Store(0, (uint)(a.x * 255.0 + 0.5));
     words.Store(4, (uint)(b.x * 255.0 + 0.5));
 }
@@ -1264,9 +1282,8 @@ void look() {
         give_back(singles[1].1, &singles[1].2);
     }
 
-    /// (v) A view made by [`show_from`] of a texture whose level 0 has no
-    /// tiles returns level 1's colour for a sample at level 0; the view as
-    /// the title asked returns zero.
+    /// (v) Shader sampling clamps at the end of the first resident run,
+    /// even when there are more resident levels beyond a hole.
     fn the_view_starts_at_the_first_level_with_tiles(rig: &mut Rig) -> Option<()> {
         rig.step = "step 5, the view from the first level with tiles";
         let cs = compile(LOOK, s!("look"), s!("cs_5_1")).ok()?;
@@ -1274,10 +1291,18 @@ void look() {
         let desc = Rig::desc(format, SIDE, LEVELS, true);
         let layout = rig.footprints(&desc);
         let (texture, tiled) = rig.reserved(&desc);
-        // Every level but the largest; each level's bytes are sixteen
-        // times its number plus one.
-        rig.give(&tiled, &texture, from_level(1));
+        // Level 1 and the coarse mips are backed, with a hole at level 2.
+        let before = STATS[6].load(Ordering::Relaxed);
+        let regions_before = STATS[5].load(Ordering::Relaxed);
+        rig.give(&tiled, &texture, from_level(1) & !(1 << 2));
+        let calls = STATS[6].load(Ordering::Relaxed) - before;
+        let regions = STATS[5].load(Ordering::Relaxed) - regions_before;
+        let given = tiled.given.lock().unwrap();
+        let heaps = given.runs.iter().map(|run| run.0).collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(calls as usize, heaps.len(), "one mapping call per backing heap");
+        drop(given);
         assert_eq!(tiled.first_shown(), Some(1));
+        assert!(!tiled.has_tiles(2));
         let upload = rig.filled(&layout, |level| (level as u8 + 1) * 16);
         rig.round_trip(&texture, &layout, Some(&upload));
         // SAFETY: plain object creation; the views are made in a heap
@@ -1318,13 +1343,16 @@ void look() {
                 },
             };
             let mut shown = as_asked;
-            show_from(&mut shown, tiled.first_shown()?, u32::from(LEVELS));
+            show_resident(&mut shown, tiled.shown_levels(), u32::from(LEVELS));
             assert_eq!(shown.Anonymous.Texture2D.MostDetailedMip, 1);
+            assert_eq!(shown.Anonymous.Texture2D.MipLevels, 1);
+            let mut legacy = as_asked;
+            legacy.Anonymous.Texture2D.MostDetailedMip = 1;
             let step = rig.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
             let mut at = views.GetCPUDescriptorHandleForHeapStart();
             rig.device.CreateShaderResourceView(&texture, Some(&raw const shown), at);
             at.ptr += step;
-            rig.device.CreateShaderResourceView(&texture, Some(&raw const as_asked), at);
+            rig.device.CreateShaderResourceView(&texture, Some(&raw const legacy), at);
             let words = rig.buffer(
                 D3D12_HEAP_TYPE_DEFAULT,
                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
@@ -1359,9 +1387,9 @@ void look() {
             back.Unmap(0, None);
             read
         };
-        eprintln!("a sample at level 0: {} through the view from level 1, {} through the view as asked", read[0], read[1]);
-        assert_eq!(read[0], 32, "the view from the first level with tiles reads level 1");
-        assert_eq!(read[1], 0, "the view from level 0 reads a level without tiles");
+        eprintln!("sample through resident view: {}, legacy view: {}; mapped {regions} regions in {calls} calls", read[0], read[1]);
+        assert_eq!(read[0], 32, "the resident view clamps sampling to level 1");
+        assert_eq!(read[1], 0, "the legacy view samples the unmapped level 2");
         Some(())
     }
 
@@ -1411,9 +1439,9 @@ void look() {
         assert_eq!(tiled.first_shown(), Some(0));
         assert_eq!(tiled.claim(1 << 0), 0, "a level with tiles is not claimed again");
         // With room everything held gets its tiles.
-        let (_, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(1), true);
+        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(1), true);
         rig.check("the last upload, with room");
-        assert!(!waiting && tiled.whole());
+        assert!(changed && !waiting && tiled.whole(), "filling the hole changes the view even if its first mip stays the same");
         read_as_given(rig, "everything given");
     }
 
@@ -1481,7 +1509,7 @@ void look() {
     }
 
     #[test]
-    fn show_from_clamps_2d_and_2d_array_and_adjusts_min_lod() {
+    fn show_resident_clamps_2d_and_2d_array_and_adjusts_min_lod() {
         let mut srv2d = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
@@ -1495,7 +1523,7 @@ void look() {
                 },
             },
         };
-        show_from(&mut srv2d, 3, 11);
+        show_resident(&mut srv2d, from_level(3), 11);
         // SAFETY: `ViewDimension` is `TEXTURE2D`.
         let v2d = unsafe { srv2d.Anonymous.Texture2D };
         assert_eq!(v2d.MostDetailedMip, 3);
@@ -1518,12 +1546,18 @@ void look() {
                 },
             },
         };
-        show_from(&mut srv_arr, 2, 11);
+        show_resident(&mut srv_arr, from_level(2), 11);
         // SAFETY: `ViewDimension` is `TEXTURE2DARRAY`.
         let varr = unsafe { srv_arr.Anonymous.Texture2DArray };
         assert_eq!(varr.MostDetailedMip, 2);
         assert_eq!(varr.MipLevels, 4);
         assert_eq!(varr.ResourceMinLODClamp, 0.0);
+
+        // A view asking for a missing range still has a valid finer mip.
+        show_resident(&mut srv_arr, 1, 11);
+        let fallback = unsafe { srv_arr.Anonymous.Texture2DArray };
+        assert_eq!(fallback.MostDetailedMip, 0);
+        assert_eq!(fallback.MipLevels, 1);
     }
 
     #[test]
@@ -1565,7 +1599,7 @@ void look() {
                 packed: false,
                 runs: Vec::new(),
             }),
-            shown: AtomicU32::new(u32::MAX),
+            shown: AtomicU32::new(0),
             held: AtomicU32::new(0),
             card: AtomicU32::new(0),
             claimed: AtomicU32::new(0),

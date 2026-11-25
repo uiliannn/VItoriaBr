@@ -2010,8 +2010,7 @@ impl State {
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
-        // Levels on demand: the slots of textures whose first level with
-        // memory changed since the last pass are made again from it.
+        // Levels on demand: rebuild slots whose resident mips have changed.
         host.texture_views_remade();
         // And with room, the textures whose upload left a held level
         // without the card's memory are uploaded again.
@@ -3638,7 +3637,7 @@ impl State {
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made
 /// once.
-fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
+pub(crate) fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
         std::sync::Mutex::new(Vec::new());
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());

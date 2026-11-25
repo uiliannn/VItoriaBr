@@ -203,8 +203,8 @@ pub fn shader_opt() -> u32 {
 }
 
 /// Everything a translation depends on besides the container: the
-/// translator's own source (hashed at build time), the value of every
-/// `VICTORY_*` switch it reads, the host facts the device hands it (widest
+/// translator's own source (hashed at build time), its `VICTORY_*`
+/// translation settings, the host facts the device hands it (widest
 /// wave, view heap limit) and the settings above. The shader cache keys on
 /// this instead of on the whole executable, so a rebuild that leaves the
 /// translator alone keeps its translations. Call it after the device is made.
@@ -839,6 +839,14 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    #[test]
+    fn a_dump_directory_is_not_part_of_the_shader_cache_key() {
+        let fingerprint = super::translation_fingerprint();
+        let fingerprint = String::from_utf8_lossy(&fingerprint);
+        assert!(!fingerprint.contains("VICTORY_EMIT_DUMP="));
+        assert!(fingerprint.contains("VICTORY_SHADER_OPT="));
+    }
 
     #[test]
     fn group_sync_defaults_to_auto_and_keeps_explicit_overrides() {
