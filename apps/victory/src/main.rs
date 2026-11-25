@@ -168,7 +168,15 @@ enum Console {
 }
 
 fn main() -> Result<()> {
-    victory_core::logging::init("info");
+    let config = victory_core::Config::load()?;
+    victory_core::logging::init("info", config.log_dir.as_deref())?;
+    tracing::info!(
+        config = ?config.source,
+        log_dir = ?config.log_dir,
+        cache_dir = %config.cache_dir.display(),
+        data_dir = %config.data_dir.display(),
+        "runtime configuration loaded"
+    );
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {
@@ -249,6 +257,7 @@ fn show_config() -> Result<()> {
     println!("game_dir    : {}", status(&cfg.game_dir));
     println!("cache_dir   : {}", cfg.cache_dir.display());
     println!("data_dir    : {}", cfg.data_dir.display());
+    println!("log_dir     : {}", status(&cfg.log_dir));
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }
@@ -257,6 +266,7 @@ fn show_config() -> Result<()> {
         .iter()
         .chain(&cfg.test_titles)
         .chain([&cfg.cache_dir, &cfg.data_dir])
+        .chain(&cfg.log_dir)
     {
         if let Err(e) = victory_core::ensure_outside_repo(p) {
             println!("POLICY VIOLATION: {e}");

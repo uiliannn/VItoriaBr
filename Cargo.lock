@@ -636,6 +636,7 @@ dependencies = [
  "blake3",
  "clap",
  "memchr",
+ "tracing",
  "victory-core",
  "victory-game",
  "victory-hle",
@@ -654,6 +655,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
+ "tracing",
  "tracing-subscriber",
 ]
 

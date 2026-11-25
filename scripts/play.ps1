@@ -14,9 +14,13 @@ param(
 )
 $settings = @{
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
+    VICTORY_PIPELINE_BOOK = '1'
     VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'; VICTORY_CARD_STEPS = '2'
     VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_TITLE_PRIORITIES = '0'; VICTORY_CARD_AWAKE = '1'
     VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'; VICTORY_SKIP_PIPELINES = 'none'
+    # Tuned for this 12-logical-core / RTX 4070 host. The upstream preset's
+    # 16-worker ceiling is measured on a 24-thread CPU and can starve rendering.
+    VICTORY_PIPELINE_WORKERS = '4'; VICTORY_PIPELINE_WAIT_MS = '12000'; VICTORY_PIPELINE_WAIT_SHARED = '1'
 }
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
@@ -27,6 +31,13 @@ if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
+if ($Build -eq 'diag') {
+    $logged = Join-Path $PSScriptRoot "..\target\diag-logged\diag\victory.exe"
+    if ((Test-Path $logged) -and
+        ((-not (Test-Path $victory)) -or ((Get-Item $logged).LastWriteTime -gt (Get-Item $victory).LastWriteTime))) {
+        $victory = $logged
+    }
+}
 if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README.md)."; return }
 if (-not (Test-Path $Exe)) { Write-Host "No $Exe."; return }
 # (Other settings left over in this window go; where your files are stays.)

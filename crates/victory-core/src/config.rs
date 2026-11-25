@@ -20,6 +20,8 @@ pub struct Config {
     /// What titles write and must keep (persistent local storage). Never
     /// inside the cache, which may be deleted at any time.
     pub data_dir: PathBuf,
+    /// Optional directory for an append-only `victory.log`.
+    pub log_dir: Option<PathBuf>,
     /// Other titles used to exercise platform-level code.
     pub test_titles: Vec<PathBuf>,
     /// The config file that was read, if any.
@@ -39,6 +41,7 @@ struct FilePaths {
     game_dir: Option<PathBuf>,
     cache_dir: Option<PathBuf>,
     data_dir: Option<PathBuf>,
+    log_dir: Option<PathBuf>,
     #[serde(default)]
     test_titles: Vec<PathBuf>,
 }
@@ -95,6 +98,7 @@ impl Config {
             game_dir: env_path("VICTORY_GAME_DIR").or(file.game_dir),
             cache_dir,
             data_dir,
+            log_dir: env_path("VICTORY_LOG_DIR").or(file.log_dir),
             test_titles,
             source,
         })

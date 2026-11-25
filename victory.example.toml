@@ -14,6 +14,10 @@ game_dir = 'D:\victory-data\game'
 # Default: %LOCALAPPDATA%\victory\data.   env: VICTORY_DATA_DIR
 # data_dir = 'D:\victory-data\data'
 
+# Append-only console log. Optional; omit to keep console-only logging.
+# env: VICTORY_LOG_DIR
+# log_dir = 'D:\victory-data\logs'
+
 # Other Xbox Series titles used to test platform-level code.
 # env: VICTORY_TEST_TITLES (separated by ';')
 test_titles = []
