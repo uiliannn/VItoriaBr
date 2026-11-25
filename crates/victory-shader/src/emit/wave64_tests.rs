@@ -320,6 +320,17 @@ fn a_sum_of_halves_over_the_wave_is_the_consoles_tree_bit_for_bit() {
 /// lanes that are here read each partner run's sum from a lane of it that is here.
 #[test]
 fn a_sum_of_halves_where_lanes_have_left_is_the_consoles_tree_bit_for_bit() {
+    check_half_sum_with_lanes_gone(64);
+}
+
+/// The same console FP16 reduction on narrow-wave hardware, with early-outs
+/// removed so both host waves can participate in the exchange.
+#[test]
+fn a_sum_of_halves_with_early_outs_runs_on_wave32_hardware() {
+    check_half_sum_with_lanes_gone(32);
+}
+
+fn check_half_sum_with_lanes_gone(host_wave: u32) {
     let mut words = vec![
         0x7DA8_0000, // v_cmpx_gt_u32 exec, s0, v0: the lanes below s0 stay
         0, // s_cbranch_execz to the end (filled in below)
@@ -340,7 +351,12 @@ fn a_sum_of_halves_where_lanes_have_left_is_the_consoles_tree_bit_for_bit() {
     words[1] = 0xBF88_0000 | (words.len() as u32 - 2);
     let native = native(&words);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let shader = lowered_on(&native, &p, &HashSet::new(), 64).expect("lower");
+    let p = if host_wave == 32 {
+        ir::without_early_outs(&p).expect("remove early-outs")
+    } else {
+        p
+    };
+    let shader = lowered_on(&native, &p, &HashSet::new(), host_wave).expect("lower");
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
         v.validate(&mut copy).expect("DXIL validation failed");
@@ -363,6 +379,32 @@ fn a_sum_of_halves_where_lanes_have_left_is_the_consoles_tree_bit_for_bit() {
     };
     let add = |a: u16, b: u16| narrow(wide(a) + wide(b));
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        crate::emit::test_skip::skip("no SM 6.6 hardware device; not run");
+        return;
+    };
+
+    let mut waves = windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+
+    // SAFETY: a plain feature query on the live device.
+    unsafe {
+        host.device.CheckFeatureSupport(
+            windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut waves).cast(),
+            size_of_val(&waves) as u32,
+        ).expect("host wave capabilities");
+    }
+
+    if !waves.WaveOps.as_bool()
+        || host_wave < waves.WaveLaneCountMin
+        || host_wave > waves.WaveLaneCountMax
+    {
+        crate::emit::test_skip::skip(&format!(
+            "host does not support WaveSize({host_wave}); not run"
+        ));
+        return;
+    }
+
     let mut ran = false;
     for stay in [64u32, 63, 40, 33, 32, 17, 5, 1] {
         let terms: Vec<u16> = (0..64u32)
@@ -529,9 +571,14 @@ fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
         crate::emit::test_skip::skip("no SM 6.6 hardware device; not run");
         return None;
     };
-    let Ok((root, pso)) = host.compute_pipeline(shader) else {
-        crate::emit::test_skip::skip("the hardware device does not take this program; not run");
-        return None;
+    let (root, pso) = match host.compute_pipeline(shader) {
+        Ok(x) => x,
+        Err(e) => {
+            crate::emit::test_skip::skip(&format!(
+                "the hardware device does not take this program: {e}; not run"
+            ));
+            return None;
+        }
     };
     let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
     for u in &shader.user_data {
