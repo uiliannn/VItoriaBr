@@ -836,6 +836,48 @@ fn v_sin_and_v_cos_f32_reduce_large_turns() {
 }
 
 #[test]
+fn signed_adds_wrap_and_saturate_under_clamp_like_rdna2() {
+    // (opcode, name, cases: [a, b] -> (result, clamped result)). The 16-bit
+    // forms read the low halves (junk above) and keep v0's high half (0).
+    let cases: [(u16, &str, [([u32; 2], u32, u32); 3]); 4] = [
+        (0x37F, "v_add_nc_i32", [
+            ([0x7FFF_FFFF, 1], 0x8000_0000, 0x7FFF_FFFF),
+            ([0x8000_0000, 0xFFFF_FFFF], 0x7FFF_FFFF, 0x8000_0000),
+            ([5, 0xFFFF_FFF9], 0xFFFF_FFFE, 0xFFFF_FFFE),
+        ]),
+        (0x376, "v_sub_nc_i32", [
+            ([0x8000_0000, 1], 0x7FFF_FFFF, 0x8000_0000),
+            ([0x7FFF_FFFF, 0xFFFF_FFFF], 0x8000_0000, 0x7FFF_FFFF),
+            ([3, 10], 0xFFFF_FFF9, 0xFFFF_FFF9),
+        ]),
+        (0x30D, "v_add_nc_i16", [
+            ([0xABCD_7FFF, 0x1234_0001], 0x8000, 0x7FFF),
+            ([0xABCD_8000, 0x1234_FFFF], 0x7FFF, 0x8000),
+            ([0xABCD_0005, 0x1234_FFF9], 0xFFFE, 0xFFFE),
+        ]),
+        (0x30E, "v_sub_nc_i16", [
+            ([0xABCD_8000, 0x1234_0001], 0x7FFF, 0x8000),
+            ([0xABCD_7FFF, 0x1234_FFFF], 0x8000, 0x7FFF),
+            ([0xABCD_0003, 0x1234_000A], 0xFFF9, 0xFFF9),
+        ]),
+    ];
+    for (op, name, cases) in cases {
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| [c.0[0], c.0[1], 0, 0]).collect();
+        for clamp in [false, true] {
+            let [w0, w1] = vop3_mod(op, 0, vgpr(1), vgpr(2), 0, 0, 0, 0, clamp);
+            let shader = build_valu_cs(&[w0, w1]);
+            run_cases(&shader, &inputs, |backend, i, _, got| {
+                let want = if clamp { cases[i].2 } else { cases[i].1 };
+                assert_eq!(
+                    got, want,
+                    "{backend}: {name} (clamp {clamp}) case {i} got {got:#010x}, want {want:#010x}"
+                );
+            });
+        }
+    }
+}
+
+#[test]
 fn v_cvt_u16_and_i16_f16_saturate() {
     // v_mov_b32 v0, 0; v_cvt_u16_f16 / v_cvt_i16_f16 v0, v1 (VOP1 0x052 / 0x053).
     let cases: &[(u16, u16, u16)] = &[
