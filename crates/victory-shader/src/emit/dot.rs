@@ -38,6 +38,12 @@ impl<'a> Lower<'a> {
             if (lo, hi) == (false, true) {
                 return Ok(x);
             }
+            if let Some(val) = l.s.m.eval_u32(x) {
+                let (top, bottom) = (val >> 16, val & 0xFFFF);
+                let packed = ((if hi { top } else { bottom }) << 16)
+                    | (if lo { top } else { bottom });
+                return Ok(l.s.m.i32(packed));
+            }
             let (k16, low) = (l.s.m.i32(16), l.s.m.i32(0xFFFF));
             let top = l.s.m.bin(c, Bin::LShr, x, k16);
             let bottom = l.s.m.bin(c, Bin::And, x, low);
@@ -84,30 +90,14 @@ impl<'a> Lower<'a> {
                 let x0 = pack_bytes(self, 0)?;
                 let x1 = pack_bytes(self, 1)?;
                 let acc = s(self, 2)?;
-                let i32_ty = self.s.t.i32;
                 let signed = name == "v_dot4_i32_i8";
-                let opcode = if signed { 163 } else { 164 };
                 let r = if signed && v.clamp {
-                    // dot4AddPacked with acc=0 stays within [-65024, +65536] and cannot overflow i32.
+                    // dot4 with acc=0 stays within [-65024, +65536] and cannot overflow i32.
                     let zero = self.s.m.i32(0);
-                    let d = self.s.op(
-                        c,
-                        "dot4AddPacked.i32",
-                        Attr::ReadNone,
-                        i32_ty,
-                        opcode,
-                        &[zero, x0, x1],
-                    );
+                    let d = self.dot4_packed(c, zero, x0, x1, true);
                     sat_i32_add(self, d, acc)
                 } else {
-                    let sum = self.s.op(
-                        c,
-                        "dot4AddPacked.i32",
-                        Attr::ReadNone,
-                        i32_ty,
-                        opcode,
-                        &[acc, x0, x1],
-                    );
+                    let sum = self.dot4_packed(c, acc, x0, x1, signed);
                     if !signed && v.clamp {
                         sat_u32_add(self, sum, acc)
                     } else {
@@ -124,24 +114,10 @@ impl<'a> Lower<'a> {
                 let acc = self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?;
                 let r = if v.clamp {
                     let zero = self.s.m.i32(0);
-                    let d = self.s.op(
-                        c,
-                        "dot4AddPacked.i32",
-                        Attr::ReadNone,
-                        self.s.t.i32,
-                        163,
-                        &[zero, s0, s1],
-                    );
+                    let d = self.dot4_packed(c, zero, s0, s1, true);
                     sat_i32_add(self, d, acc)
                 } else {
-                    self.s.op(
-                        c,
-                        "dot4AddPacked.i32",
-                        Attr::ReadNone,
-                        self.s.t.i32,
-                        163,
-                        &[acc, s0, s1],
-                    )
+                    self.dot4_packed(c, acc, s0, s1, true)
                 };
                 write_dot_int(self, r)
             }
@@ -181,6 +157,7 @@ impl<'a> Lower<'a> {
                     self.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[s1_hi]);
 
                 let z = self.s.m.f32(0x8000_0000);
+                // VOP2 has no neg bits; VOP3 v_dot2c_f32_f16 negates the whole src pair, whereas VOP3P splits neg/neg_hi.
                 if v.neg & 1 != 0 {
                     f_s0_lo = self.s.m.bin(c, Bin::Sub, z, f_s0_lo);
                     if !is_vop3p {
@@ -200,26 +177,30 @@ impl<'a> Lower<'a> {
                     f_s1_hi = self.s.m.bin(c, Bin::Sub, z, f_s1_hi);
                 }
 
-                let mut acc = if name == "v_dot2c_f32_f16" {
+                let acc = if name == "v_dot2c_f32_f16" {
                     let Some(Operand::Vector { reg, .. }) = v.dst else {
                         return Err("an accumulator");
                     };
                     let acc_val = inst.read(Reg::V(reg)).ok_or("an accumulator")?;
-                    match self.floats.get(&acc_val) {
+                    let a = match self.floats.get(&acc_val) {
                         Some(&x) => x,
                         None => {
                             let x = self.i32_of(acc_val)?;
                             self.as_float(x)
                         }
+                    };
+                    if v.neg >> 2 & 1 != 0 {
+                        self.s.m.bin(c, Bin::Sub, z, a)
+                    } else {
+                        a
                     }
                 } else {
+                    // fsrc (via f) already negates src2 when v.neg[2] is set.
                     f(self, 2)?
                 };
-                if v.neg >> 2 & 1 != 0 {
-                    acc = self.s.m.bin(c, Bin::Sub, z, acc);
-                }
 
-                // Chained fused multiplies match RDNA2 rounding; write_f applies v.clamp and v.omod.
+                // RDNA2 ISA executes V_DOT2_F32_F16 as two chained f32 FMAs (pair 0 then pair 1),
+                // converting f16 inputs (including denormals) to exact f32 first; write_f applies v.clamp and v.omod.
                 let inner = self.fmad(f_s0_lo, f_s1_lo, acc);
                 let r = self.fmad(f_s0_hi, f_s1_hi, inner);
                 float(self, r)
@@ -286,5 +267,94 @@ impl<'a> Lower<'a> {
             }
             _ => Err("an unhandled dot product"),
         }
+    }
+
+    /// Lowers `acc + dot4(a, b)` for packed 4x i8 (`signed = true`) or 4x u8.
+    /// Constant multiplicands expand in scalar ops rather than calling
+    /// `dx.op.dot4AddPacked`, avoiding Intel Arc IGC's 16-bit constant broadcast
+    /// miscompilation when a multiplicand folds to a constant.
+    fn dot4_packed(&mut self, c: usize, acc: V, a: V, b: V, signed: bool) -> V {
+        match (self.s.m.eval_u32(a), self.s.m.eval_u32(b)) {
+            (Some(ka), Some(kb)) => {
+                let dot = (0..4).fold(0i32, |s, k| {
+                    let (x, y) = if signed {
+                        (
+                            i32::from((ka >> (8 * k)) as i8),
+                            i32::from((kb >> (8 * k)) as i8),
+                        )
+                    } else {
+                        (
+                            ((ka >> (8 * k)) & 0xFF) as i32,
+                            ((kb >> (8 * k)) & 0xFF) as i32,
+                        )
+                    };
+                    s.wrapping_add(x * y)
+                });
+                if dot == 0 {
+                    acc
+                } else {
+                    let kd = self.s.m.i32(dot as u32);
+                    self.s.m.bin(c, Bin::Add, acc, kd)
+                }
+            }
+            (Some(k), None) => self.dot4_const(c, acc, b, k, signed),
+            (None, Some(k)) => self.dot4_const(c, acc, a, k, signed),
+            (None, None) => self.s.op(
+                c,
+                "dot4AddPacked.i32",
+                Attr::ReadNone,
+                self.s.t.i32,
+                if signed { 163 } else { 164 },
+                &[acc, a, b],
+            ),
+        }
+    }
+
+    fn dot4_const(&mut self, c: usize, mut acc: V, var: V, k: u32, signed: bool) -> V {
+        let mut k24 = None;
+        let mut mask = None;
+        for byte in 0..4u32 {
+            let w = if signed {
+                i32::from((k >> (8 * byte)) as i8)
+            } else {
+                ((k >> (8 * byte)) & 0xFF) as i32
+            };
+            if w == 0 {
+                continue;
+            }
+            let lane = if signed {
+                let k24_v = *k24.get_or_insert_with(|| self.s.m.i32(24));
+                let left = (3 - byte) * 8;
+                let aligned = if left == 0 {
+                    var
+                } else {
+                    let kl = self.s.m.i32(left);
+                    self.s.m.bin(c, Bin::Shl, var, kl)
+                };
+                self.s.m.bin(c, Bin::AShr, aligned, k24_v)
+            } else {
+                let m = *mask.get_or_insert_with(|| self.s.m.i32(0xFF));
+                let shifted = if byte == 0 {
+                    var
+                } else {
+                    let ks = self.s.m.i32(byte * 8);
+                    self.s.m.bin(c, Bin::LShr, var, ks)
+                };
+                self.s.m.bin(c, Bin::And, shifted, m)
+            };
+            let prod = match w {
+                1 => lane,
+                -1 => {
+                    acc = self.s.m.bin(c, Bin::Sub, acc, lane);
+                    continue;
+                }
+                _ => {
+                    let kw = self.s.m.i32(w as u32);
+                    self.s.m.bin(c, Bin::Mul, lane, kw)
+                }
+            };
+            acc = self.s.m.bin(c, Bin::Add, acc, prod);
+        }
+        acc
     }
 }

@@ -326,6 +326,108 @@ impl Module {
         }
     }
 
+    /// Evaluates a constant or pure scalar instruction tree to a 32-bit pattern.
+    pub fn eval_u32(&self, v: V) -> Option<u32> {
+        let (w, bits) = self.eval_bits(v, 16)?;
+        (w == 32).then_some(bits as u32)
+    }
+
+    fn int_width(&self, ty: Ty) -> Option<u32> {
+        match self.types[ty.0 as usize] {
+            TypeDef::Int(bits) if (1..=32).contains(&bits) => Some(bits),
+            TypeDef::Float => Some(32),
+            _ => None,
+        }
+    }
+
+    fn eval_bits(&self, v: V, depth: u8) -> Option<(u32, u64)> {
+        let mask = |w: u32| u64::from(u32::MAX >> (32 - w));
+        let sext = |x: u64, w: u32| ((x << (64 - w)) as i64) >> (64 - w);
+        let ty = self.type_of(v);
+        let w = self.int_width(ty)?;
+        let m = mask(w);
+        match v {
+            V::Const(i) => match self.consts[i as usize].1 {
+                Const::Int(x) => Some((w, (x as u64) & m)),
+                Const::Float(bits) => Some((32, u64::from(bits))),
+                _ => None,
+            },
+            V::Inst(i) if depth > 0 => {
+                if self.types[ty.0 as usize] == TypeDef::Float
+                    && !matches!(self.insts[i as usize].op, Op::Cast(Cast::Bitcast, _) | Op::Select(..))
+                {
+                    return None;
+                }
+                match &self.insts[i as usize].op {
+                    Op::Cast(Cast::Bitcast | Cast::ZExt | Cast::Trunc, src) => {
+                        let (_, sv) = self.eval_bits(*src, depth - 1)?;
+                        Some((w, sv & m))
+                    }
+                    Op::Cast(Cast::SExt, src) => {
+                        let (sw, sv) = self.eval_bits(*src, depth - 1)?;
+                        Some((w, (sext(sv, sw) as u64) & m))
+                    }
+                    Op::Bin(op, a, b) => {
+                        let (_, av) = self.eval_bits(*a, depth - 1)?;
+                        let (_, bv) = self.eval_bits(*b, depth - 1)?;
+                        let res = match op {
+                            Bin::Add => av.wrapping_add(bv),
+                            Bin::Sub => av.wrapping_sub(bv),
+                            Bin::Mul => av.wrapping_mul(bv),
+                            Bin::And => av & bv,
+                            Bin::Or => av | bv,
+                            Bin::Xor => av ^ bv,
+                            Bin::Shl if bv < u64::from(w) => av << bv,
+                            Bin::LShr if bv < u64::from(w) => av >> bv,
+                            Bin::AShr if bv < u64::from(w) => (sext(av, w) >> bv) as u64,
+                            Bin::UDiv if bv != 0 => av / bv,
+                            Bin::URem if bv != 0 => av % bv,
+                            Bin::SDiv => {
+                                let (sa, sb) = (sext(av, w), sext(bv, w));
+                                if sb == 0 || (w == 32 && sa == i64::from(i32::MIN) && sb == -1) {
+                                    return None;
+                                }
+                                (sa / sb) as u64
+                            }
+                            _ => return None,
+                        };
+                        Some((w, res & m))
+                    }
+                    Op::Cmp(p, a, b) => {
+                        let aw = self.int_width(self.type_of(*a))?;
+                        if !(32..=41).contains(p) || self.types[self.type_of(*a).0 as usize] == TypeDef::Float {
+                            return None;
+                        }
+                        let (_, av) = self.eval_bits(*a, depth - 1)?;
+                        let (_, bv) = self.eval_bits(*b, depth - 1)?;
+                        let (sa, sb) = (sext(av, aw), sext(bv, aw));
+                        let cond = match *p {
+                            pred::EQ => av == bv,
+                            pred::NE => av != bv,
+                            pred::IUGT => av > bv,
+                            pred::IUGE => av >= bv,
+                            pred::IULT => av < bv,
+                            pred::IULE => av <= bv,
+                            pred::SGT => sa > sb,
+                            pred::SGE => sa >= sb,
+                            pred::SLT => sa < sb,
+                            pred::SLE => sa <= sb,
+                            _ => return None,
+                        };
+                        Some((1, u64::from(cond)))
+                    }
+                    Op::Select(cond, t, f) => {
+                        let (_, cv) = self.eval_bits(*cond, depth - 1)?;
+                        let branch = if cv & 1 != 0 { *t } else { *f };
+                        self.eval_bits(branch, depth - 1)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Gives constant `old` the content of `new` (both stay valid).
     pub fn replace_const(&mut self, old: V, new: V) {
         if let (V::Const(o), V::Const(n)) = (old, new) {
