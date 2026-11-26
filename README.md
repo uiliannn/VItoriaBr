@@ -88,7 +88,7 @@ Medido com `victory translate --validate --pipelines` (`dxil.dll` Windows SDK `1
   - `s_barrier` em blocos que não pós-dominam a entrada, dentro de loops ou após `abort_block` emite apenas memory fence (`TGSM_FENCE`/`UAV_FENCE`), prevenindo deadlocks de `BAR.SYNC` em wave32.
 - **Proteção anti-TDR em submissões e `ExecuteIndirect`** (`1ca533d`, `8a75883`, `6f99f75`, `crates/victory-gpu/src/{host,indirect}.rs`):
   - `host::execute()` submete 1 command list por vez com fence wait (evitando acumular >2 s de TDR); `indirect.rs` zera argumentos `DispatchMesh` corrompidos e limita dispatches válidos (`4096` grupos, `BUDGET = 2^22`).
-  - `VICTORY_SHADER_LOOP_LIMIT` habilitado também em `release` (com padrão `4096`).
+  - `VICTORY_SHADER_LOOP_LIMIT` habilitado também em `release` (com padrão `128` para pixel, `256` para vértice/mesh e `4096` para compute).
 
 > **Aviso de GPU (TDR):** entrar no mundo 3D em uma GPU real ainda pode disparar reset do driver de vídeo (TDR). Para inspecionar sem risco de travar o driver, use o perfil `diag` com `VICTORY_D3D12_WARP=1` (adaptador em software).
 
@@ -288,7 +288,7 @@ Measured via `victory translate --validate --pipelines` (`dxil.dll` Windows SDK 
   - `s_barrier` in non-post-dominating, loop, or post-`abort_block` blocks emits a memory-only fence (`TGSM_FENCE`/`UAV_FENCE`), preventing `BAR.SYNC` deadlocks on wave32.
 - **Anti-TDR submission chunking & indirect bounds** (`1ca533d`, `8a75883`, `6f99f75`, `crates/victory-gpu/src/{host,indirect}.rs`):
   - `host::execute()` submits one command list per fence wait; `indirect.rs` zeroes out-of-range `DispatchMesh` arguments and caps valid dispatches (`4096` groups, `BUDGET = 2^22`).
-  - `VICTORY_SHADER_LOOP_LIMIT` enabled in `release` builds as well (default `4096`).
+  - `VICTORY_SHADER_LOOP_LIMIT` enabled in `release` builds as well (default `128` for pixel, `256` for vertex/mesh and `4096` for compute).
 
 > **Warning:** Entering the 3D world on a real GPU can still trigger a display driver reset (TDR). Use a `diag` build with `VICTORY_D3D12_WARP=1` to inspect safely on the software adapter.
 
