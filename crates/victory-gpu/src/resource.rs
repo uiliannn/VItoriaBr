@@ -591,7 +591,8 @@ pub(crate) fn family(format: u32) -> u32 {
         (44, 47),
         (48, 52),
         (53, 59),
-        (60, 65),
+        // R8: 61..=64. A8_UNORM (65) has no typeless format and no cast to R8.
+        (60, 64),
         (70, 72),
         (73, 75),
         (76, 78),
@@ -3403,6 +3404,23 @@ pub(crate) fn test_buffer(width: u64) -> This {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn a8_unorm_stands_outside_the_r8_family() {
+        const R8_TYPELESS: u32 = 60;
+        const A8_UNORM: u32 = 65;
+        // R8_UNORM, R8_UINT, R8_SNORM and R8_SINT cast through R8_TYPELESS.
+        for format in R8_TYPELESS..A8_UNORM {
+            assert_eq!(family(format), R8_TYPELESS, "format {format}");
+        }
+        // A8_UNORM does not: an R8 view of an A8 texture is refused instead
+        // of being turned into an A8 view.
+        assert_eq!(family(A8_UNORM), A8_UNORM);
+        assert_ne!(family(61), family(A8_UNORM));
+        // The neighbours keep their families: R16_SINT (59), R1_UNORM (66).
+        assert_eq!(family(59), 53);
+        assert_eq!(family(66), 66);
+    }
 
     type Release = extern "system" fn(This) -> u32;
     type Map = extern "system" fn(This, u32, *const c_void, *mut *mut u8) -> HRESULT;
