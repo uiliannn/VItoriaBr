@@ -5677,6 +5677,13 @@ impl<'a> Lower<'a> {
                 let (r, carry) = self.add_sub_carry(c, name == "s_addc_u32", a, b, Some(cin));
                 (r, Some(carry))
             }
+            "s_sext_i32_i8" | "s_sext_i32_i16" => {
+                // RDNA2 ISA: D.i = signext(S0[7:0]) or signext(S0[15:0]).
+                let a = src32(self, 0)?;
+                let k = self.s.m.i32(if name == "s_sext_i32_i8" { 24 } else { 16 });
+                let t = self.s.m.bin(c, Bin::Shl, a, k);
+                (self.s.m.bin(c, Bin::AShr, t, k), None)
+            }
             "s_mul_i32" | "s_mulk_i32" => {
                 let a = src32(self, 0)?;
                 let b = if name == "s_mulk_i32" {
@@ -11712,6 +11719,47 @@ mod tests {
         assert_eq!(refusal(&words), refusal(&direct));
         words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
         lowers(&words, group_ids_xy).expect("dead timestamp");
+    }
+
+    /// `s_sext_i32_i8` and `s_sext_i32_i16` decode and translate in a program
+    /// that stores the result (`s12` moved to `v0`).
+    #[test]
+    fn scalar_sign_extensions_translate() {
+        let program = |body: [u32; 2]| {
+            let mut words = vec![
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0xFA00_0000,
+            ];
+            // v_mov_b32 v1..v4, s0..s3
+            words.extend((0..4u32).map(|i| 0x7E00_0200 | (i + 1) << 17 | i));
+            words.extend(body);
+            words.extend([0xE070_0000, 0x8002_0000, S_ENDPGM]); // buffer_store_dword v0
+            words
+        };
+        let buffer = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let constants = RootParam { sgprs: 4, ..root(RootType::Constants, 0, 0) };
+        for (body, name) in [
+            ([0xBE80_0000 | 12 << 16 | 0x19 << 8 | 1, 0x7E00_020C], "s_sext_i32_i8"),
+            ([0xBE80_0000 | 12 << 16 | 0x1A << 8 | 1, 0x7E00_020C], "s_sext_i32_i16"),
+        ] {
+            let code: Vec<u8> = program(body).iter().flat_map(|w| w.to_le_bytes()).collect();
+            let insts = crate::gfx10::decode(&code).unwrap();
+            let names: Vec<_> = insts.iter().map(|i| i.name()).collect();
+            assert!(names.contains(&Some(name)), "{names:?}");
+            let layout = vec![constants, root(RootType::Table, 4, 1)];
+            lower_with(&program(body), layout, vec![buffer])
+                .unwrap_or_else(|e| panic!("{name} {body:08x?}: {e}"));
+        }
     }
 
     #[test]

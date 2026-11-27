@@ -590,6 +590,22 @@ fn v_cmp_lg_is_false_for_nan() {
 }
 
 #[test]
+fn scalar_sign_extensions_match_rdna2() {
+    // s_sext_i32_i8 / s_sext_i32_i16 s12, s0; v_mov_b32 v0, s12.
+    let cases = [[0x1234_5680u32, 0, 0, 0], [0xFFFF_7F7F, 0, 0, 0], [0x0000_80FF, 0, 0, 0]];
+    for (op, name, want) in [
+        (0x19u8, "s_sext_i32_i8", [0xFFFF_FF80u32, 0x0000_007F, 0xFFFF_FFFF]),
+        (0x1A, "s_sext_i32_i16", [0x0000_5680, 0x0000_7F7F, 0xFFFF_80FF]),
+    ] {
+        let sop1 = 0xBE80_0000 | 12 << 16 | u32::from(op) << 8;
+        let shader = build_valu_cs(&[sop1, vop1(0x001, 0, sgpr(12))]);
+        run_cases(&shader, &cases, |backend, i, _, got| {
+            assert_eq!(got, want[i], "{backend}: {name} case {i} got {got:#010x}, want {:#010x}", want[i]);
+        });
+    }
+}
+
+#[test]
 fn v_fract_f32_never_returns_one() {
     // v_fract_f32 v0, v1 (VOP1 opcode 0x020)
     let shader = build_valu_cs(&[vop1(0x020, 0, vgpr(1))]);
