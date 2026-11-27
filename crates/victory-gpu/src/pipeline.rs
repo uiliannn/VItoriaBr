@@ -205,13 +205,21 @@ impl Shader {
 
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
-    use victory_shader::{Container, FourCC, HwStage};
+    use victory_shader::{Container, FourCC, HwStage, ShaderError};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let programs = match c.part(FourCC::DXIL) {
-        Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
-        None => Vec::new(),
+    if c.part(FourCC::DXIL).is_none() {
+        static LOGGED_NO_DXIL: std::sync::Once = std::sync::Once::new();
+        LOGGED_NO_DXIL.call_once(|| {
+            let chunks: Vec<FourCC> = c.parts.iter().map(|p| p.fourcc).collect();
+            tracing::warn!(?chunks, "DXBC container has no DXIL part");
+        });
+    }
+    let programs = match victory_shader::container_native_programs(&c) {
+        Ok(programs) => programs,
+        Err(ShaderError::Malformed("no DXIL part")) => Vec::new(),
+        Err(e) => return Err(e.to_string()),
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
@@ -284,7 +292,7 @@ static BUILDER: Mutex<Builder> = Mutex::new(Builder {
 /// Whether `shaders` are a pipeline of the structure builder.
 #[cfg(windows)]
 fn of_builder(shaders: &[Arc<Shader>]) -> bool {
-    use victory_shader::{Container, FourCC};
+    use victory_shader::Container;
     let [shader] = shaders else { return false };
     if shader.stage != "compute" {
         return false;
@@ -292,8 +300,8 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
     let Ok(c) = Container::parse(&shader.container) else {
         return false;
     };
-    c.part(FourCC::DXIL)
-        .and_then(|part| victory_shader::native_programs(part.data).ok())
+    victory_shader::container_native_programs(&c)
+        .ok()
         .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
 }
 
@@ -325,12 +333,12 @@ impl Shader {
 /// ray-tracing structure.
 #[cfg(windows)]
 fn container_walks(container: &[u8]) -> bool {
-    use victory_shader::{Container, FourCC};
+    use victory_shader::Container;
     let Ok(c) = Container::parse(container) else {
         return false;
     };
-    c.part(FourCC::DXIL)
-        .and_then(|part| victory_shader::native_programs(part.data).ok())
+    victory_shader::container_native_programs(&c)
+        .ok()
         .is_some_and(|programs| programs.iter().any(|p| code_walks(&p.code)))
 }
 

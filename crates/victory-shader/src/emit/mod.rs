@@ -333,10 +333,7 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 
 fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
-    let dxil = c
-        .part(FourCC::DXIL)
-        .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
+    let native = crate::container_native_programs(&c)?
         .into_iter()
         .find(|p| {
             matches!(
@@ -859,6 +856,32 @@ mod tests {
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
         assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
         assert_eq!(parse_shader_opt(Some("on")), all);
+    }
+
+    #[test]
+    fn translates_xdat_native_program_from_non_dxil_parts() {
+        let xdat = crate::native::tests::test_xdat_compute_part(&[0xBF81_0000], [8, 8, 1]);
+        for fourcc in [super::FourCC::XBOX, super::FourCC::XSDX] {
+            let bytes = crate::dxbc::build(&[
+                (super::FourCC::SFI0, &[0; 8]),
+                (fourcc, &xdat),
+            ]);
+            let shader = super::translate(&bytes).unwrap_or_else(|e| {
+                panic!("expected {fourcc} XDAT container to translate, got: {e}")
+            });
+            assert_eq!(shader.stage, super::HwStage::Cs);
+            let host = super::Container::parse(&shader.dxil).unwrap();
+            assert!(host.part(super::FourCC::DXIL).is_some());
+        }
+
+        let no_xdat = crate::dxbc::build(&[
+            (super::FourCC::SFI0, &[0; 8]),
+            (super::FourCC::ACCC, b"FSPX\x01\x00\x00\x00"),
+        ]);
+        assert_eq!(
+            super::translate(&no_xdat).unwrap_err(),
+            crate::ShaderError::Malformed("no DXIL part")
+        );
     }
 
     #[test]

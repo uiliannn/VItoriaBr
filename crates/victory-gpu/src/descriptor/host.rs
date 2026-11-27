@@ -1898,6 +1898,129 @@ impl HostHeap {
         }
     }
 
+    /// Prepares the shader-visible GPU descriptor, non-shader-visible CPU
+    /// descriptor, and host resource needed for `ClearUnorderedAccessView*`.
+    /// Returns `(gpu_handle, cpu_handle, host_resource, allocated_dynamic_slot)`.
+    pub(crate) fn clear_uav_setup(
+        &self,
+        title_heap: &super::Heap,
+        list: &crate::host::HostList,
+        gpu_handle: u64,
+        cpu_handle: u64,
+        resource: crate::object::This,
+        uint: bool,
+        partial: bool,
+    ) -> Option<(
+        D3D12_GPU_DESCRIPTOR_HANDLE,
+        D3D12_CPU_DESCRIPTOR_HANDLE,
+        ID3D12Resource,
+        Option<u32>,
+    )> {
+        let host = host()?;
+        let view = super::view(cpu_handle)
+            .or_else(|| super::view(gpu_handle))
+            .or_else(|| {
+                (!resource.is_null() && crate::resource::host_resource(resource).is_some())
+                    .then_some(View::Unordered(resource as usize, 0, None))
+            })?;
+        let resolved = placed_texture(&view).unwrap_or(view);
+        if let Some((shadow, address, len)) = buffer_copy(&resolved) {
+            // SAFETY: a live buffer.
+            let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
+            if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+                return None;
+            }
+            let desc = clear_buffer_uav_desc(&resolved, &shadow, address, uint)?;
+            if partial {
+                shadow.refresh(list, address, len);
+            }
+            shadow.gpu_writes(list, address, len);
+            let host_cpu = host.cpu_uav_slot();
+            // SAFETY: a slot of our heap and a live buffer.
+            unsafe {
+                host.device.CreateUnorderedAccessView(
+                    &shadow.buffer,
+                    None::<&ID3D12Resource>,
+                    Some(&desc),
+                    host_cpu,
+                );
+            }
+            let dyn_slot = self.dynamic(1)?;
+            // SAFETY: a dynamic slot of our shader-visible heap and a live buffer.
+            unsafe {
+                host.device.CreateUnorderedAccessView(
+                    &shadow.buffer,
+                    None::<&ID3D12Resource>,
+                    Some(&desc),
+                    self.cpu(dyn_slot),
+                );
+            }
+            self.keep(dyn_slot, Some(shadow.buffer.clone()));
+            return Some((
+                self.gpu_handle(dyn_slot),
+                host_cpu,
+                shadow.buffer.clone(),
+                Some(dyn_slot),
+            ));
+        }
+
+        let View::Unordered(r, _, desc) = resolved else {
+            return None;
+        };
+        let target = r as crate::object::This;
+        let (texture, uav_desc) = texture_uav_target(target, desc.as_ref())?;
+        // D3D12 ClearUnorderedAccessView* rejects typeless views.
+        if let Some(d) = &uav_desc {
+            let f = d.Format.0 as u32;
+            if f == 0 || (crate::resource::family(f) == f && crate::resource::family(f + 1) == f) {
+                return None;
+            }
+        }
+        const UNORDERED_ACCESS: u32 = 0x8;
+        list.texture_written(target);
+        if !list.twin_use(target, true, true) {
+            crate::list::ensure_state(list, target, UNORDERED_ACCESS);
+        }
+        crate::texture::host_written(target);
+
+        let host_cpu = host.cpu_uav_slot();
+        // SAFETY: a slot of our heap and a live texture.
+        unsafe {
+            host.device.CreateUnorderedAccessView(
+                &texture,
+                None::<&ID3D12Resource>,
+                uav_desc.as_ref().map(std::ptr::from_ref),
+                host_cpu,
+            );
+        }
+        // Use the title's shader-visible slot when it lies within the host heap
+        // and already mirrors a compatible view; otherwise use a dynamic slot.
+        if let Some(index) = title_heap.index(gpu_handle)
+            && index < self.count
+            && self.mirror(index, gpu_handle, true).is_some()
+            && self
+                .kept
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(index as usize)
+                .is_some_and(Option::is_some)
+        {
+            return Some((self.gpu_handle(index), host_cpu, texture, None));
+        }
+        let dyn_slot = self.dynamic(1)?;
+        // SAFETY: a dynamic slot of our shader-visible heap and a live texture.
+        unsafe {
+            host.device.CreateUnorderedAccessView(
+                &texture,
+                None::<&ID3D12Resource>,
+                uav_desc.as_ref().map(std::ptr::from_ref),
+                self.cpu(dyn_slot),
+            );
+        }
+        self.keep(dyn_slot, Some(texture.clone()));
+        Some((self.gpu_handle(dyn_slot), host_cpu, texture, Some(dyn_slot)))
+    }
+
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
     /// memory (the list's own, which it holds).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
@@ -2912,6 +3035,98 @@ fn twin_uav(
     Some(desc)
 }
 
+/// Resolves a texture UAV's target resource (colour twin if depth) and host
+/// view description, validating format/flags with [`fits`].
+fn texture_uav_target(
+    resource: crate::object::This,
+    desc: Option<&[u32; 10]>,
+) -> Option<(ID3D12Resource, Option<D3D12_UNORDERED_ACCESS_VIEW_DESC>)> {
+    let texture = crate::resource::host_resource(resource)?;
+    let mut desc = desc.map(uav_desc);
+    let twin = crate::resource::twin_resource(resource)
+        .and_then(|twin| Some((twin, twin_uav(twin, desc.as_ref())?)))
+        .or_else(|| {
+            let twin = crate::resource::twin_plane_resource(resource)?;
+            Some((twin, twin_uav(twin, desc.as_ref())?))
+        });
+    let texture = match twin {
+        Some((twin, view)) => {
+            desc = Some(view);
+            twin
+        }
+        None => texture,
+    };
+    if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
+        return None;
+    }
+    Some((texture.clone(), desc))
+}
+
+/// Builds a D3D12-valid typed buffer UAV description for `ClearUnorderedAccessView*`.
+/// Raw/structured (`R32_TYPELESS` / `DXGI_FORMAT_UNKNOWN`) views are cleared as
+/// `R32_UINT` or `R32_FLOAT` because D3D12 rejects typeless/unknown formats in clears.
+fn clear_buffer_uav_desc(
+    view: &View,
+    shadow: &crate::shadow::Shadow,
+    address: u64,
+    uint: bool,
+) -> Option<D3D12_UNORDERED_ACCESS_VIEW_DESC> {
+    let (words, raw_offset) = match view {
+        View::Unordered(_, _, Some(d)) => (d, shadow.offset(address)),
+        View::Placed(true, _, d) => (d[..10].try_into().ok()?, shadow.offset(address)),
+        _ => return None,
+    };
+    let mut desc = uav_desc(words);
+    // SAFETY: a buffer view's union member.
+    let buf = unsafe { &mut desc.Anonymous.Buffer };
+    let is_raw = buf.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+    let (first, count, element, stride, _) = buffer_fields(view)?;
+    // SAFETY: a live buffer.
+    let width = unsafe { shadow.buffer.GetDesc() }.Width;
+    if stride == 0
+        && !is_raw
+        && desc.Format != DXGI_FORMAT_UNKNOWN
+        && desc.Format != DXGI_FORMAT_R32_TYPELESS
+    {
+        if element == 0 || !raw_offset.is_multiple_of(element) {
+            return None;
+        }
+        buf.FirstElement += raw_offset / element;
+        buf.CounterOffsetInBytes = 0;
+        if buffer_view_ok(desc.Format, buf.FirstElement, buf.NumElements, 0, false, width) {
+            return Some(desc);
+        }
+        return None;
+    }
+    let byte_offset = raw_offset.checked_add(first.checked_mul(element)?)?;
+    let byte_len = u64::from(count).checked_mul(element)?;
+    if !byte_offset.is_multiple_of(4) || byte_len < 4 {
+        return None;
+    }
+    let dwords = u32::try_from(byte_len / 4).ok()?;
+    let end = byte_offset.checked_add(u64::from(dwords) * 4)?;
+    if end > width {
+        return None;
+    }
+    Some(D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: if uint {
+            DXGI_FORMAT_R32_UINT
+        } else {
+            DXGI_FORMAT_R32_FLOAT
+        },
+        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_UAV {
+                FirstElement: byte_offset / 4,
+                NumElements: dwords,
+                StructureByteStride: 0,
+                CounterOffsetInBytes: 0,
+                Flags: D3D12_BUFFER_UAV_FLAG_NONE,
+            },
+        },
+    })
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -3016,14 +3231,14 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Unordered(resource, _counter, desc) => {
             let resource = *resource as crate::object::This;
-            let Some(texture) = crate::resource::host_resource(resource) else {
+            if crate::resource::host_resource(resource).is_none() {
                 return match (crate::resource::buffer_bytes(resource), desc) {
                     (Some((data, len)), Some(desc)) => {
                         buffer_uav(data as u64, len, uav_desc(desc), at)
                     }
                     _ => None,
                 };
-            };
+            }
             // The first such views of depth textures are logged as the
             // title describes them (format, dimension, then mip, slices and
             // plane): they say which planes shaders write, and as what.
@@ -3037,37 +3252,19 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     );
                 }
             }
-            let mut desc = desc.as_ref().map(uav_desc);
-            // A depth texture's unordered access is its colour twin's: the
-            // host gives a depth texture none.
-            let twin = crate::resource::twin_resource(resource)
-                .and_then(|twin| Some((twin, twin_uav(twin, desc.as_ref())?)))
-                // A view of the depth plane of a texture with a stencil
-                // plane: of that plane's own twin.
-                .or_else(|| {
-                    let twin = crate::resource::twin_plane_resource(resource)?;
-                    Some((twin, twin_uav(twin, desc.as_ref())?))
-                });
-            let texture = match twin {
-                Some((twin, view)) => {
-                    desc = Some(view);
-                    twin
-                }
-                None => texture,
-            };
-            if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
+            let Some((texture, desc)) = texture_uav_target(resource, desc.as_ref()) else {
                 return None;
-            }
+            };
             // SAFETY: a live texture and a slot of our heap.
             unsafe {
                 device.CreateUnorderedAccessView(
-                    texture,
+                    &texture,
                     None::<&ID3D12Resource>,
                     desc.as_ref().map(std::ptr::from_ref),
                     at,
                 )
             };
-            Some(Some(texture.clone()))
+            Some(Some(texture))
         }
         View::Sampler(words) => {
             // SAFETY: 13 words in the host's layout.

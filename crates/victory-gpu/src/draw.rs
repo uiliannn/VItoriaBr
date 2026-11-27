@@ -751,6 +751,82 @@ impl State {
         }
     }
 
+    fn bind_heaps(&mut self, list: &HostList) {
+        if self.host_heaps != self.heaps {
+            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
+                .heaps
+                .iter()
+                .filter(|&&h| h != 0)
+                .filter_map(|&h| crate::descriptor::heap(h as This).host())
+                .map(|h| Some(h.heap.clone()))
+                .collect();
+            heaps.iter().flatten().for_each(|h| list.keep(h));
+            // SAFETY: an open list and shader-visible heaps.
+            unsafe { list.list.SetDescriptorHeaps(&heaps) };
+            self.host_heaps = self.heaps;
+            self.host_roots = [0; 2];
+        }
+    }
+
+    /// `ClearUnorderedAccessViewUint` / `ClearUnorderedAccessViewFloat`: ensures the
+    /// shader-visible view heap is bound on the host list and emits the clear.
+    pub(crate) fn clear_uav(
+        &mut self,
+        list: &HostList,
+        gpu_handle: u64,
+        cpu_handle: u64,
+        resource: This,
+        uint_values: Option<[u32; 4]>,
+        float_values: Option<[f32; 4]>,
+        rects: Option<&[RECT]>,
+    ) {
+        let heap_ptr = self.heaps[0];
+        if heap_ptr == 0 {
+            return;
+        }
+        let title_heap = crate::descriptor::heap(heap_ptr as This);
+        let Some(host_heap) = title_heap.host() else {
+            return;
+        };
+        let Some((host_gpu, host_cpu, host_res, dyn_slot)) = host_heap.clear_uav_setup(
+            title_heap,
+            list,
+            gpu_handle,
+            cpu_handle,
+            resource,
+            uint_values.is_some(),
+            rects.is_some(),
+        ) else {
+            return;
+        };
+        if let Some(slot) = dyn_slot {
+            self.dynamic.push((heap_ptr, slot, 1));
+        }
+        self.bind_heaps(list);
+        list.keep(&host_res);
+        // SAFETY: an open list, bound shader-visible GPU descriptor, non-shader-visible
+        // CPU descriptor, and live resource transitioned to UNORDERED_ACCESS.
+        unsafe {
+            if let Some(values) = uint_values {
+                list.list.ClearUnorderedAccessViewUint(
+                    host_gpu,
+                    host_cpu,
+                    &host_res,
+                    &values,
+                    rects.unwrap_or(&[]),
+                );
+            } else if let Some(values) = float_values {
+                list.list.ClearUnorderedAccessViewFloat(
+                    host_gpu,
+                    host_cpu,
+                    &host_res,
+                    &values,
+                    rects.unwrap_or(&[]),
+                );
+            }
+        }
+    }
+
     fn roots(&mut self, compute: bool) -> &mut Vec<Root> {
         if compute {
             &mut self.compute
@@ -1173,20 +1249,7 @@ impl State {
         }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
-        if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
-                .heaps
-                .iter()
-                .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
-                .collect();
-            heaps.iter().flatten().for_each(|h| list.keep(h));
-            // SAFETY: an open list and shader-visible heaps.
-            unsafe { l.SetDescriptorHeaps(&heaps) };
-            self.host_heaps = self.heaps;
-            self.host_roots = [0; 2];
-        }
+        self.bind_heaps(list);
         // The depth target a draw only tests, for the views of it that the
         // draw's shaders read (`readable`).
         let tested = if !compute && self.depth_state == DEPTH_READ {

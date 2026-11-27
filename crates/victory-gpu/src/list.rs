@@ -1347,6 +1347,62 @@ extern "system" fn clear_dsv(
     let _ = (this, handle, flags, depth, stencil, count, rects);
 }
 
+/// `ClearUnorderedAccessViewUint(gpu_handle, cpu_handle, resource, values, count, rects)` (slot 0x1a8).
+extern "system" fn clear_uav_uint(
+    this: This,
+    gpu_handle: u64,
+    cpu_handle: u64,
+    resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    #[cfg(windows)]
+    {
+        // SAFETY: the title passes four u32s (null is tolerated).
+        let Some(&values) = (unsafe { values.as_ref() }) else {
+            return;
+        };
+        let rects = (count > 0 && !rects.is_null()).then(|| {
+            // SAFETY: the title passes `count` rectangles, laid out as the host's.
+            unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
+        });
+        with_state(this, |list, s| {
+            s.clear_uav(list, gpu_handle, cpu_handle, resource, Some(values), None, rects)
+        });
+    }
+    #[cfg(not(windows))]
+    let _ = (this, gpu_handle, cpu_handle, resource, values, count, rects);
+}
+
+/// `ClearUnorderedAccessViewFloat(gpu_handle, cpu_handle, resource, values, count, rects)` (slot 0x1b0).
+extern "system" fn clear_uav_float(
+    this: This,
+    gpu_handle: u64,
+    cpu_handle: u64,
+    resource: This,
+    values: *const [f32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    #[cfg(windows)]
+    {
+        // SAFETY: the title passes four f32s (null is tolerated).
+        let Some(&values) = (unsafe { values.as_ref() }) else {
+            return;
+        };
+        let rects = (count > 0 && !rects.is_null()).then(|| {
+            // SAFETY: the title passes `count` rectangles, laid out as the host's.
+            unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
+        });
+        with_state(this, |list, s| {
+            s.clear_uav(list, gpu_handle, cpu_handle, resource, None, Some(values), rects)
+        });
+    }
+    #[cfg(not(windows))]
+    let _ = (this, gpu_handle, cpu_handle, resource, values, count, rects);
+}
+
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
@@ -2113,7 +2169,7 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
 /// layout): IUnknown 3, object 4, device child 1, list 1, graphics list 96
 /// (59 as on PC, then console ones), then versions 1-6 (6 + 1 + 1 + 11 + 3
 /// + 13): 140 slots.
-const METHODS: [(usize, *const ()); 52] = [
+const METHODS: [(usize, *const ()); 54] = [
     (0, list_query as *const ()),
     (2, list_release as *const ()),
     (7, object::parent_device as *const ()),      // 0x38
@@ -2154,6 +2210,8 @@ const METHODS: [(usize, *const ()); 52] = [
     (50, state::targets as *const ()),            // 0x190
     (51, clear_dsv as *const ()),                 // 0x198
     (52, clear_rtv as *const ()),                 // 0x1a0
+    (53, clear_uav_uint as *const ()),            // 0x1a8
+    (54, clear_uav_float as *const ()),           // 0x1b0
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
     (68, state::depth_bounds as *const ()),       // 0x220 depth bounds
@@ -2296,6 +2354,76 @@ mod tests {
         resolve_queries(list, null, 0, 0, 2, buffer, u64::MAX - 8);
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         for object in [buffer, list, allocator] {
+            assert_eq!(release(object), 0);
+        }
+    }
+
+    /// Slots 0x1a8 (`ClearUnorderedAccessViewUint`) and 0x1b0 (`ClearUnorderedAccessViewFloat`)
+    /// are wired in both older and newer command list layouts and handle UAV clears cleanly.
+    #[test]
+    fn clear_uav_slots_are_wired_and_record_safely() {
+        for newer in [false, true] {
+            let table = list_table(newer);
+            assert_eq!(table[53], clear_uav_uint as *const ());
+            assert_eq!(table[54], clear_uav_float as *const ());
+        }
+
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+
+        let heap_desc = [0u32, 8, 1, 0]; // CBV_SRV_UAV, 8 slots, SHADER_VISIBLE
+        let mut heap = null;
+        assert_eq!(
+            crate::descriptor::create_heap(
+                null,
+                heap_desc.as_ptr().cast(),
+                &crate::object::guid(
+                    0x8efb471d,
+                    0x616c,
+                    0x4f49,
+                    [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+                ),
+                &mut heap,
+            ),
+            S_OK
+        );
+        let gpu_start = slot::<extern "system" fn(This) -> u64>(heap, 0x50)(heap);
+        let cpu_start = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+
+        let buffer = crate::resource::test_buffer(64);
+        // DXGI_FORMAT_R32_UINT (42), D3D12_UAV_DIMENSION_BUFFER (1), FirstElement=0, NumElements=16
+        let uav_desc = [42u32, 1, 0, 0, 16, 0, 0, 0, 0, 0];
+        crate::descriptor::create_uav(null, buffer, null, uav_desc.as_ptr().cast(), cpu_start);
+
+        let heaps = [heap];
+        slot::<extern "system" fn(This, u32, *const This)>(list, 0x100)(list, 1, heaps.as_ptr());
+
+        let u32_vals = [0u32; 4];
+        slot::<extern "system" fn(This, u64, u64, This, *const [u32; 4], u32, *const Rect)>(
+            list, 0x1a8,
+        )(list, gpu_start, cpu_start, buffer, &u32_vals, 0, std::ptr::null());
+
+        let f32_vals = [1.0f32, 0.0, 0.0, 1.0];
+        slot::<extern "system" fn(This, u64, u64, This, *const [f32; 4], u32, *const Rect)>(
+            list, 0x1b0,
+        )(list, gpu_start, cpu_start, buffer, &f32_vals, 0, std::ptr::null());
+
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
+            S_OK
+        );
+        assert_eq!(reset(list, allocator, null), S_OK);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        for object in [buffer, heap, list, allocator] {
             assert_eq!(release(object), 0);
         }
     }

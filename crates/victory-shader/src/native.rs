@@ -69,7 +69,7 @@
 //! Unknown versions are rejected so a format change shows up as an error.
 
 use crate::ShaderError::{self, Malformed};
-use crate::dxbc::{u32_at, u64_at};
+use crate::dxbc::{Container, FourCC, u32_at, u64_at};
 
 const XDAT_OFFSET: usize = 0x18;
 const MAX_XDAT_ENTRIES: usize = 64;
@@ -602,6 +602,28 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
     Ok(out)
 }
 
+/// Finds native programs in a DXBC container: checks the `DXIL` part first,
+/// then falls back to any other part (such as `XBOX`, `XSDX`, `SHDR`, `SHEX`)
+/// that contains an `XDAT` table yielding native programs. Logs the chunk list
+/// once when a container lacks a `DXIL` part.
+pub fn container_native_programs(c: &Container<'_>) -> Result<Vec<NativeProgram>, ShaderError> {
+    if let Some(dxil) = c.part(FourCC::DXIL) {
+        return native_programs(dxil.data);
+    }
+    static LOGGED_NO_DXIL: std::sync::Once = std::sync::Once::new();
+    LOGGED_NO_DXIL.call_once(|| {
+        let chunks: Vec<FourCC> = c.parts.iter().map(|p| p.fourcc).collect();
+        eprintln!("victory-shader: DXBC container has no DXIL part; chunks={chunks:?}");
+    });
+    for part in &c.parts {
+        let found = native_programs(part.data)?;
+        if !found.is_empty() {
+            return Ok(found);
+        }
+    }
+    Err(Malformed("no DXIL part"))
+}
+
 /// The entries of `size` bytes from `at`, with their count at `count_at`.
 fn semantics(data: &[u8], at: usize, size: usize, count_at: usize) -> Result<&[u8], ShaderError> {
     let count = u32_at(data, count_at)?;
@@ -718,8 +740,20 @@ fn bytes(data: &[u8], offset: u64, len: u64) -> Option<&[u8]> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Builds a test `XDAT` part holding a single native compute program.
+    pub(crate) fn test_xdat_compute_part(words: &[u32], threads: [u32; 3]) -> Vec<u8> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut blob = fssm(&[(HwStage::Cs, &code)]);
+        let e = stage_data_at(&blob, HwStage::Cs);
+        blob[e + CS_RSRC2..][..4].copy_from_slice(&0u32.to_le_bytes());
+        for (i, t) in threads.iter().enumerate() {
+            blob[e + CS_THREADS + 4 * i..][..4].copy_from_slice(&t.to_le_bytes());
+        }
+        part(&[(KIND_NATIVE, &xbch(&blob))])
+    }
 
     const VS_CODE: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
     const PS_CODE: [u8; 4] = [9, 10, 11, 12];

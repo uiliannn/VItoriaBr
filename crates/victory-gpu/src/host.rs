@@ -52,6 +52,10 @@ pub(crate) struct Host {
     dsvs: ID3D12DescriptorHeap,
     dsv_size: u32,
     next_dsv: AtomicU32,
+    /// A non-shader-visible ring of UAV views for `ClearUnorderedAccessView*`.
+    uavs: ID3D12DescriptorHeap,
+    uav_size: u32,
+    next_uav: AtomicU32,
     /// With `VICTORY_D3D12_DEBUG` set (diagnostics builds): the debug
     /// layer's messages.
     messages: Option<ID3D12InfoQueue>,
@@ -716,6 +720,14 @@ fn create() -> windows::core::Result<Host> {
                 ..Default::default()
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        let uavs: ID3D12DescriptorHeap =
+            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: RTV_RING,
+                ..Default::default()
+            })?;
+        let uav_size =
+            device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
@@ -731,6 +743,9 @@ fn create() -> windows::core::Result<Host> {
             dsvs,
             dsv_size,
             next_dsv: AtomicU32::new(0),
+            uavs,
+            uav_size,
+            next_uav: AtomicU32::new(0),
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
@@ -6401,6 +6416,16 @@ impl Host {
                 .CreateDepthStencilView(resource, desc.map(|d| d as *const _), handle);
             handle
         }
+    }
+
+    /// A non-shader-visible descriptor slot from the host's ring, for
+    /// `ClearUnorderedAccessViewUint` / `ClearUnorderedAccessViewFloat`.
+    pub(crate) fn cpu_uav_slot(&self) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        let slot = self.next_uav.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+        // SAFETY: a slot of our non-shader-visible CBV/SRV/UAV heap.
+        let mut handle = unsafe { self.uavs.GetCPUDescriptorHandleForHeapStart() };
+        handle.ptr += (slot * self.uav_size) as usize;
+        handle
     }
 }
 

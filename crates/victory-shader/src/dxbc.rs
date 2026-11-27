@@ -17,6 +17,11 @@ pub struct FourCC(pub [u8; 4]);
 
 impl FourCC {
     pub const DXIL: FourCC = FourCC(*b"DXIL");
+    pub const XBOX: FourCC = FourCC(*b"XBOX");
+    pub const XSDX: FourCC = FourCC(*b"XSDX");
+    pub const SHDR: FourCC = FourCC(*b"SHDR");
+    pub const SHEX: FourCC = FourCC(*b"SHEX");
+    pub const ACCC: FourCC = FourCC(*b"ACCC");
     pub const STAT: FourCC = FourCC(*b"STAT");
     pub const RTS0: FourCC = FourCC(*b"RTS0");
     pub const PSV0: FourCC = FourCC(*b"PSV0");
