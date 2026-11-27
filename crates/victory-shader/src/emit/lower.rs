@@ -3769,6 +3769,79 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, keep, r, t)
     }
 
+    /// The f32 `bits` as a normalized 16-bit integer (in the low 16 bits):
+    /// clamped to [-1, 1] (`signed`) or [0, 1], times 32767 or 65535,
+    /// rounded to nearest even once from the exact product; NaN gives 0.
+    /// Worked in integers, as [`Self::cvt_norm16`] does for f16: the
+    /// product of a 24-bit significand and a 16-bit scale has up to 40
+    /// significant bits, more than f32 keeps.
+    fn f32_to_norm16(&mut self, bits: V, signed: bool) -> V {
+        let c = self.cur;
+        let i64t = self.s.m.int(64);
+        self.s.flags |= flags::INT64;
+        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+        let scale = if signed { 0x7FFF } else { 0xFFFF };
+        let (k0, k23, k31) = (k(self, 0), k(self, 23), k(self, 31));
+        let mag = k(self, 0x7FFF_FFFF);
+        let mag = self.s.m.bin(c, Bin::And, bits, mag);
+        let neg = self.s.m.bin(c, Bin::LShr, bits, k31);
+        let neg = self.s.m.cmp(c, pred::NE, neg, k0);
+        // |x| < 1: x = m * 2^-s, m the significand (with its implicit bit
+        // unless denormal) and s = 150 - e (149 for a denormal), s >= 24.
+        let e = self.s.m.bin(c, Bin::LShr, mag, k23);
+        let man_mask = k(self, 0x7F_FFFF);
+        let man = self.s.m.bin(c, Bin::And, mag, man_mask);
+        let implicit = k(self, 0x80_0000);
+        let normal = self.s.m.bin(c, Bin::Or, man, implicit);
+        let sub = self.s.m.cmp(c, pred::EQ, e, k0);
+        let m = self.s.m.select(c, sub, man, normal);
+        let k150 = k(self, 150);
+        let s_normal = self.s.m.bin(c, Bin::Sub, k150, e);
+        let k149 = k(self, 149);
+        let s = self.s.m.select(c, sub, k149, s_normal);
+        // Past 63 the quotient is 0 and the remainder below half anyway.
+        let k63 = k(self, 63);
+        let far = self.s.m.cmp(c, pred::IUGT, s, k63);
+        let s = self.s.m.select(c, far, k63, s);
+        let m = self.s.m.cast(c, Cast::ZExt, m, i64t);
+        let s = self.s.m.cast(c, Cast::ZExt, s, i64t);
+        let ks = self.s.m.int_const(i64t, scale);
+        let p = self.s.m.bin(c, Bin::Mul, m, ks);
+        let q = self.s.m.bin(c, Bin::LShr, p, s);
+        let one = self.s.m.int_const(i64t, 1);
+        let one_s = self.s.m.bin(c, Bin::Shl, one, s);
+        let low_mask = self.s.m.bin(c, Bin::Sub, one_s, one);
+        let rem = self.s.m.bin(c, Bin::And, p, low_mask);
+        let half = self.s.m.bin(c, Bin::LShr, one_s, one);
+        let above = self.s.m.cmp(c, pred::IUGT, rem, half);
+        let tie = self.s.m.cmp(c, pred::EQ, rem, half);
+        let odd = self.s.m.bin(c, Bin::And, q, one);
+        let z64 = self.s.m.int_const(i64t, 0);
+        let odd = self.s.m.cmp(c, pred::NE, odd, z64);
+        let tie_up = self.s.m.bin(c, Bin::And, tie, odd);
+        let up = self.s.m.bin(c, Bin::Or, above, tie_up);
+        let q = self.s.m.cast(c, Cast::Trunc, q, self.s.t.i32);
+        let k1 = k(self, 1);
+        let r = self.s.m.select(c, up, k1, k0);
+        let r = self.s.m.bin(c, Bin::Add, q, r);
+        // |x| >= 1 (and infinity) saturates; NaN gives 0.
+        let one_f = k(self, 0x3F80_0000);
+        let big = self.s.m.cmp(c, pred::IUGE, mag, one_f);
+        let ks32 = k(self, scale as u32);
+        let r = self.s.m.select(c, big, ks32, r);
+        let inf = k(self, 0x7F80_0000);
+        let nan = self.s.m.cmp(c, pred::IUGT, mag, inf);
+        let r = self.s.m.select(c, nan, k0, r);
+        let r = if signed {
+            let n = self.s.m.bin(c, Bin::Sub, k0, r);
+            self.s.m.select(c, neg, n, r)
+        } else {
+            self.s.m.select(c, neg, k0, r)
+        };
+        let m16 = k(self, 0xFFFF);
+        self.s.m.bin(c, Bin::And, r, m16)
+    }
+
     /// Whether an f32 value is NaN, tested in integer arithmetic so host
     /// drivers (such as NVIDIA) do not fold `fcmp uno` away under fast-math.
     fn is_nan_f32(&mut self, f: V) -> V {
@@ -7384,6 +7457,21 @@ impl<'a> Lower<'a> {
                     }
                 };
                 float(self, r)
+            }
+            "v_cvt_pknorm_i16_f32" | "v_cvt_pknorm_u16_f32" => {
+                // RDNA2 ISA: D.lo = (snorm|unorm)S0.f32, D.hi = the same of
+                // S1, with the conversion v_cvt_norm_*16_f16 make here
+                // (clamped, scaled, rounded to nearest even once from the
+                // exact product, NaN gives 0), on f32 sources.
+                let signed = name == "v_cvt_pknorm_i16_f32";
+                let (a, b) = (f(self, 0)?, f(self, 1)?);
+                let (a, b) = (self.as_int(a), self.as_int(b));
+                let lo = self.f32_to_norm16(a, signed);
+                let hi = self.f32_to_norm16(b, signed);
+                let k16 = self.s.m.i32(16);
+                let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
+                let r = self.s.m.bin(c, Bin::Or, lo, hi);
+                int(self, r)
             }
             "v_movrels_b32" | "v_movreld_b32" | "v_movrelsd_b32" => {
                 // M0 indexes the source (movrels), the destination (movreld)
@@ -11767,6 +11855,47 @@ mod tests {
             buffer_format(49),
             Some((&[2, 10, 10, 10][..], Numeric::Sint))
         );
+    }
+
+    /// `v_cvt_pknorm_i16_f32` and `v_cvt_pknorm_u16_f32` decode and translate in
+    /// a program that stores the result.
+    #[test]
+    fn f32_norm_packs_translate() {
+        let program = |body: [u32; 2]| {
+            let mut words = vec![
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0xFA00_0000,
+            ];
+            // v_mov_b32 v1..v4, s0..s3
+            words.extend((0..4u32).map(|i| 0x7E00_0200 | (i + 1) << 17 | i));
+            words.extend(body);
+            words.extend([0xE070_0000, 0x8002_0000, S_ENDPGM]); // buffer_store_dword v0
+            words
+        };
+        let buffer = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let constants = RootParam { sgprs: 4, ..root(RootType::Constants, 0, 0) };
+        for (body, name) in [
+            ([0xD400_0000 | 0x368 << 16, 0x101 | 0x102 << 9], "v_cvt_pknorm_i16_f32"),
+            ([0xD400_0000 | 0x369 << 16, 0x101 | 0x102 << 9], "v_cvt_pknorm_u16_f32"),
+        ] {
+            let code: Vec<u8> = program(body).iter().flat_map(|w| w.to_le_bytes()).collect();
+            let insts = crate::gfx10::decode(&code).unwrap();
+            let names: Vec<_> = insts.iter().map(|i| i.name()).collect();
+            assert!(names.contains(&Some(name)), "{names:?}");
+            let layout = vec![constants, root(RootType::Table, 4, 1)];
+            lower_with(&program(body), layout, vec![buffer])
+                .unwrap_or_else(|e| panic!("{name} {body:08x?}: {e}"));
+        }
     }
 
     /// A half's value (sign, 5-bit exponent biased 15, 10-bit mantissa), as

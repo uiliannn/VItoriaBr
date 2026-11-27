@@ -422,6 +422,39 @@ fn v_permlane16_and_x16_read_the_lanes_their_selectors_pick() {
     }
 }
 
+/// RDNA2's f32-to-norm16 conversion: clamped, scaled, rounded to nearest
+/// even once from the exact product (f64 holds it exactly), NaN gives 0.
+fn f32_norm16_reference(x: f32, signed: bool) -> u32 {
+    if x.is_nan() {
+        return 0;
+    }
+    let (lo, scale) = if signed { (-1.0, 32767.0) } else { (0.0, 65535.0) };
+    let p = f64::from(x.clamp(lo, 1.0)) * scale;
+    p.round_ties_even() as i32 as u32 & 0xFFFF
+}
+
+#[test]
+fn v_cvt_pknorm_i16_and_u16_f32_pack_two_norm_conversions() {
+    // v_cvt_pknorm_*16_f32 v0, v1, v2: src0's conversion low, src1's high.
+    let xs = [
+        0.0f32, -0.0, 1.0, -1.0, 0.5, -0.5, 2.0, -7.0, 1e-30, f32::NAN, f32::INFINITY,
+        f32::NEG_INFINITY, 0.25, 0.999_999_9, 1.0 / 3.0, -2.0 / 3.0,
+        // 16383.5 / 32767 and 32767.5 / 65535 are ties for one scale or the other
+        16383.5 / 32767.0, 32767.5 / 65535.0, f32::from_bits(1),
+    ];
+    let pairs: Vec<(f32, f32)> = xs.iter().enumerate().map(|(i, &a)| (a, xs[(i * 5 + 2) % xs.len()])).collect();
+    for (op, signed, name) in [(0x368u16, true, "v_cvt_pknorm_i16_f32"), (0x369, false, "v_cvt_pknorm_u16_f32")] {
+        let [w0, w1] = vop3(op, 0, vgpr(1), vgpr(2), 0);
+        let shader = build_valu_cs(&[w0, w1]);
+        let inputs: Vec<[u32; 4]> = pairs.iter().map(|&(a, b)| [a.to_bits(), b.to_bits(), 0, 0]).collect();
+        run_cases(&shader, &inputs, |backend, i, _, got| {
+            let (a, b) = pairs[i];
+            let want = f32_norm16_reference(a, signed) | f32_norm16_reference(b, signed) << 16;
+            assert_eq!(got, want, "{backend}: {name}({a}, {b}) = {got:#010x}, want {want:#010x}");
+        });
+    }
+}
+
 #[test]
 fn v_med3_f32_matches_rdna2_with_nan() {
     // v_med3_f32 v0, v1, v2, v3 (VOP3 opcode 0x157)
