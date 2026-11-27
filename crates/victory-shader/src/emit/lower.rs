@@ -5576,6 +5576,78 @@ impl<'a> Lower<'a> {
                     self.set(scc, Val::Bit(s));
                     Ok(())
                 }
+                "s_bfe_u64" | "s_bfe_i64" | "s_bfm_b64" => {
+                    // RDNA2 ISA. s_bfe: (S0.u64 >> S1[5:0]) & ((1 << S1[22:16])
+                    // - 1), sign-extended from the field's top bit for _i64
+                    // (a width of 64 or more takes every bit, as s_bfe_u32's
+                    // 32 does here); SCC = (D != 0). s_bfm_b64: ((1 <<
+                    // S0[5:0]) - 1) << S1[5:0], no SCC.
+                    let i64t = self.s.m.int(64);
+                    self.s.flags |= flags::INT64;
+                    let wide64 = |l: &mut Self, a: V, b: V| {
+                        let a = l.s.m.cast(c, Cast::ZExt, a, i64t);
+                        let b = l.s.m.cast(c, Cast::ZExt, b, i64t);
+                        let k32 = l.s.m.int_const(i64t, 32);
+                        let b = l.s.m.bin(c, Bin::Shl, b, k32);
+                        l.s.m.bin(c, Bin::Or, a, b)
+                    };
+                    let k63 = self.s.m.int_const(i64t, 63);
+                    let one = self.s.m.int_const(i64t, 1);
+                    let r = if name == "s_bfm_b64" {
+                        let (w, off) = (src32(self, 0)?, src32(self, 1)?);
+                        let w = self.s.m.cast(c, Cast::ZExt, w, i64t);
+                        let w = self.s.m.bin(c, Bin::And, w, k63);
+                        let off = self.s.m.cast(c, Cast::ZExt, off, i64t);
+                        let off = self.s.m.bin(c, Bin::And, off, k63);
+                        let m = self.s.m.bin(c, Bin::Shl, one, w);
+                        let m = self.s.m.bin(c, Bin::Sub, m, one);
+                        self.s.m.bin(c, Bin::Shl, m, off)
+                    } else {
+                        let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                        let x = wide64(self, a, b);
+                        let s1 = src32(self, 1)?;
+                        let s1 = self.s.m.cast(c, Cast::ZExt, s1, i64t);
+                        let off = self.s.m.bin(c, Bin::And, s1, k63);
+                        let k16 = self.s.m.int_const(i64t, 16);
+                        let k127 = self.s.m.int_const(i64t, 0x7F);
+                        let w = self.s.m.bin(c, Bin::LShr, s1, k16);
+                        let w = self.s.m.bin(c, Bin::And, w, k127);
+                        let signed = name == "s_bfe_i64";
+                        let shift = if signed { Bin::AShr } else { Bin::LShr };
+                        let shifted = self.s.m.bin(c, shift, x, off);
+                        let k64 = self.s.m.int_const(i64t, 64);
+                        let full = self.s.m.cmp(c, pred::IUGE, w, k64);
+                        let w = self.s.m.bin(c, Bin::And, w, k63);
+                        let mask = self.s.m.bin(c, Bin::Shl, one, w);
+                        let mask = self.s.m.bin(c, Bin::Sub, mask, one);
+                        let ones = self.s.m.int_const(i64t, -1);
+                        let mask = self.s.m.select(c, full, ones, mask);
+                        let r = self.s.m.bin(c, Bin::And, shifted, mask);
+                        if signed {
+                            let left = self.s.m.bin(c, Bin::Sub, k64, w);
+                            let left = self.s.m.bin(c, Bin::And, left, k63);
+                            let t = self.s.m.bin(c, Bin::Shl, r, left);
+                            let t = self.s.m.bin(c, Bin::AShr, t, left);
+                            let z = self.s.m.int_const(i64t, 0);
+                            let is0 = self.s.m.cmp(c, pred::EQ, w, z);
+                            let keep = self.s.m.bin(c, Bin::Or, full, is0);
+                            self.s.m.select(c, keep, r, t)
+                        } else {
+                            r
+                        }
+                    };
+                    let rl = self.s.m.cast(c, Cast::Trunc, r, self.s.t.i32);
+                    let k32 = self.s.m.int_const(i64t, 32);
+                    let rh = self.s.m.bin(c, Bin::LShr, r, k32);
+                    let rh = self.s.m.cast(c, Cast::Trunc, rh, self.s.t.i32);
+                    self.set(lo, Val::I32(rl));
+                    self.set(hi, Val::I32(rh));
+                    if name != "s_bfm_b64" {
+                        let s = nonzero(self, rl, rh);
+                        self.set(scc, Val::Bit(s));
+                    }
+                    Ok(())
+                }
                 "s_lshl_b64" | "s_lshr_b64" | "s_ashr_i64" => {
                     let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
                     let n = src32(self, 1)?;
@@ -11585,6 +11657,48 @@ mod tests {
             }]
         };
         lower_with(&words, layout(), used()).unwrap();
+    }
+
+    /// `s_bfe_u64`, `s_bfe_i64` and `s_bfm_b64` decode and translate in a program
+    /// that stores the result (`s12` moved to `v0`).
+    #[test]
+    fn scalar_64_bit_bitfields_translate() {
+        let program = |body: [u32; 2]| {
+            let mut words = vec![
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0xFA00_0000,
+            ];
+            // v_mov_b32 v1..v4, s0..s3
+            words.extend((0..4u32).map(|i| 0x7E00_0200 | (i + 1) << 17 | i));
+            words.extend(body);
+            words.extend([0xE070_0000, 0x8002_0000, S_ENDPGM]); // buffer_store_dword v0
+            words
+        };
+        let buffer = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let constants = RootParam { sgprs: 4, ..root(RootType::Constants, 0, 0) };
+        for (body, name) in [
+            ([0x8000_0000 | 0x29 << 23 | 12 << 16 | 2 << 8, 0x7E00_020C], "s_bfe_u64"),
+            ([0x8000_0000 | 0x2A << 23 | 12 << 16 | 2 << 8, 0x7E00_020C], "s_bfe_i64"),
+            ([0x8000_0000 | 0x25 << 23 | 12 << 16 | 1 << 8, 0x7E00_020C], "s_bfm_b64"),
+        ] {
+            let code: Vec<u8> = program(body).iter().flat_map(|w| w.to_le_bytes()).collect();
+            let insts = crate::gfx10::decode(&code).unwrap();
+            let names: Vec<_> = insts.iter().map(|i| i.name()).collect();
+            assert!(names.contains(&Some(name)), "{names:?}");
+            let layout = vec![constants, root(RootType::Table, 4, 1)];
+            lower_with(&program(body), layout, vec![buffer])
+                .unwrap_or_else(|e| panic!("{name} {body:08x?}: {e}"));
+        }
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.

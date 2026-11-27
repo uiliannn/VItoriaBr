@@ -298,6 +298,46 @@ fn f16_to_f32(bits: u16) -> f32 {
 }
 
 #[test]
+fn scalar_64_bit_bitfields_match_rdna2() {
+    // s_bfe_u64/i64 s[12:13], s[0:1], s2 and s_bfm_b64 s[12:13], s0, s1;
+    // then v_mov_b32 v0, s12 or s13.
+    let v = |x: [u32; 4]| u64::from(x[1]) << 32 | u64::from(x[0]);
+    let bfe = move |x: [u32; 4], signed: bool| {
+        let (off, w) = (x[2] & 63, (x[2] >> 16) & 0x7F);
+        let t = if signed { ((v(x) as i64) >> off) as u64 } else { v(x) >> off };
+        match w {
+            0 => 0,
+            64.. => t,
+            _ if signed => (((t << (64 - w)) as i64) >> (64 - w)) as u64,
+            _ => t & ((1 << w) - 1),
+        }
+    };
+    let cases = [
+        [0x89AB_CDEFu32, 0x0123_4567, 28 | 8 << 16, 0], // a field across the dwords
+        [0, 0x8000_0000, 60 | 4 << 16, 0],             // the top nibble: sign set
+        [0xFFFF_FFFF, 0x7FFF_FFFF, 64 << 16, 0],        // every bit
+        [5, 0, 1, 0],                                   // width 0
+    ];
+    type Want = Box<dyn Fn([u32; 4]) -> u64>;
+    let checks: [(&str, u32, Want); 3] = [
+        ("s_bfe_u64", 0x8000_0000 | 0x29 << 23 | 12 << 16 | 2 << 8, Box::new(move |x| bfe(x, false))),
+        ("s_bfe_i64", 0x8000_0000 | 0x2A << 23 | 12 << 16 | 2 << 8, Box::new(move |x| bfe(x, true))),
+        ("s_bfm_b64", 0x8000_0000 | 0x25 << 23 | 12 << 16 | 1 << 8, Box::new(|x| {
+            (((1u128 << (x[0] & 63)) - 1) as u64) << (x[1] & 63)
+        })),
+    ];
+    for (name, op, want) in checks {
+        for (h, read) in [(0, 12u8), (1, 13)] {
+            let shader = build_valu_cs(&[op, vop1(0x001, 0, sgpr(read))]);
+            run_cases(&shader, &cases, |backend, i, inp, got| {
+                let want = (want(inp) >> (32 * h)) as u32;
+                assert_eq!(got, want, "{backend}: {name} case {i} dword {h} got {got:#010x}, want {want:#010x}");
+            });
+        }
+    }
+}
+
+#[test]
 fn packed_add_selects_halves_of_inline_constants() {
     // Add the inline constant 1/(2*pi) to v1 (zero) to read back its two halves.
     // The same GFX10 source field (248) has a different bit pattern for a
