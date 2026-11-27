@@ -12,6 +12,7 @@ use std::alloc::Layout;
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use opus_pure::OpusDecoder;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
@@ -127,6 +128,7 @@ pub struct Connection {
     event: HANDLE,
     options: u32,
     per_stream: u32,
+    pace: Mutex<Vec<Option<Instant>>>,
     state: Mutex<State>,
 }
 
@@ -198,6 +200,7 @@ pub extern "system" fn XApuConnect(
         event,
         options: input.options,
         per_stream: input.commands_per_stream,
+        pace: Mutex::new(vec![None; streams]),
         state: Mutex::new(State {
             streams: (0..streams).map(|_| None).collect(),
             queued: vec![0; streams],
@@ -242,6 +245,40 @@ pub extern "system" fn XApuEnqueueCommand(
     }
     // SAFETY: a connection from `XApuConnect`; every command starts with an id.
     let (connection, id) = unsafe { (&*handle, command.read_unaligned()) };
+    if id.kind == PROCESS {
+        let slow = super::audio::av_sync_slow_factor();
+        if slow > 1.0 {
+            // SAFETY: a process command is this struct.
+            let frame_count = unsafe { command.cast::<Process>().read_unaligned() }.frame_count;
+            if (1..=MAX_FRAMES as u32).contains(&frame_count) {
+                let wait = {
+                    let mut pace = connection.pace.lock().unwrap_or_else(|e| e.into_inner());
+                    pace.get_mut(id.stream as usize).and_then(|slot| {
+                        let now = Instant::now();
+                        let wait = slot
+                            .and_then(|deadline| deadline.checked_duration_since(now))
+                            .map(|d| d.min(Duration::from_millis(150)));
+                        let packet_us = (u64::from(frame_count) * 1_000_000) / 48_000;
+                        let step = Duration::from_micros(((packet_us as f64) * slow) as u64);
+                        let min_base = now.checked_sub(Duration::from_millis(200)).unwrap_or(now);
+                        let base = slot.unwrap_or(now).max(min_base);
+                        *slot = Some(base + step);
+                        wait
+                    })
+                };
+                if let Some(d) = wait
+                    && !d.is_zero()
+                {
+                    std::thread::sleep(d);
+                }
+            }
+        }
+    } else if matches!(id.kind, ACTIVATE | DEACTIVATE | RESET) {
+        let mut pace = connection.pace.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = pace.get_mut(id.stream as usize) {
+            *slot = None;
+        }
+    }
     let mut state = lock(connection);
     let stream = id.stream as usize;
     if stream >= state.streams.len() {

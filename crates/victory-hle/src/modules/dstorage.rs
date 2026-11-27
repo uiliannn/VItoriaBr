@@ -17,11 +17,9 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
-use std::os::windows::fs::FileExt;
-use std::os::windows::io::FromRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
@@ -118,6 +116,8 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     const GENERIC_READ: u32 = 0x8000_0000;
     const FILE_SHARE_READ: u32 = 1;
     const OPEN_EXISTING: u32 = 3;
+    const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+    const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
     if path.is_null() {
         return E_INVALIDARG;
     }
@@ -128,7 +128,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         FILE_SHARE_READ,
         std::ptr::null(),
         OPEN_EXISTING,
-        0,
+        FILE_FLAG_OVERLAPPED | FILE_FLAG_SEQUENTIAL_SCAN,
         std::ptr::null_mut(),
     );
     // SAFETY: the title passes a NUL-terminated path.
@@ -218,11 +218,13 @@ extern "system" fn create_queue(
     )
 }
 
-/// The title asks for 32 MiB and stops if this fails.
+/// The title asks for 32 MiB and stops if this fails. Keep at least
+/// `STAGING` (64 MiB) unless `VICTORY_STAGING_MB` explicitly overrides it.
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
-    tracing::info!(size, "dstorage: staging buffer size");
+    let effective = effective_staging(u64::from(size));
+    tracing::info!(requested = size, effective, "dstorage: staging buffer size");
     if let Some(scheduler) = scheduler() {
-        scheduler.lock().staging = u64::from(size);
+        scheduler.lock().staging = effective;
     }
     S_OK
 }
@@ -332,8 +334,23 @@ struct Scheduler {
 /// Priority weights per class (low, normal, high and real-time), as the
 /// console's: about 10x per level, counted against request sizes.
 const COST: [u64; 3] = [100, 10, 1];
-/// The console's default staging buffer.
-const STAGING: u64 = 32 << 20;
+/// Default staging buffer (raised from 32 MiB to 64 MiB for parallel streaming).
+const STAGING: u64 = 64 << 20;
+
+fn staging_override() -> Option<u64> {
+    static OVERRIDE: OnceLock<Option<u64>> = OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        std::env::var("VICTORY_STAGING_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&mb| mb > 0)
+            .map(|mb| mb << 20)
+    })
+}
+
+fn effective_staging(requested: u64) -> u64 {
+    staging_override().unwrap_or_else(|| requested.max(STAGING))
+}
 
 struct Lanes {
     lanes: HashMap<u64, Lane>,
@@ -409,7 +426,7 @@ fn scheduler() -> Option<&'static Scheduler> {
                     next_id: 0,
                     next_seq: 0,
                     staged: 0,
-                    staging: STAGING,
+                    staging: staging_override().unwrap_or(STAGING),
                     starved: false,
                     clock: [0; 3],
                     now: 0,
@@ -946,29 +963,34 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             if !bounce {
                 return read_into(request, out).map(|()| size);
             }
-            let mut data = vec![0; size];
-            read_into(request, &mut data)?;
-            out.copy_from_slice(&data);
-            Ok(size)
+            with_src_buf(size, |data| {
+                read_into(request, data)?;
+                out.copy_from_slice(data);
+                Ok(size)
+            })
         })
         .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
-    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
-    // The console's order: zlib first, then BCPack.
-    let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
-        packed.truncate(n);
-        Cow::Owned(packed)
-    } else {
-        source
-    };
-    into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+    with_source(request, |source| {
+        // The console's order: zlib first, then BCPack.
+        if bc != 0 && options & ZLIB != 0 {
+            with_stage_buf(request.intermediate_size as usize, |packed| {
+                let n = inflate(source, packed).map_err(|hr| fail(hr, "zlib"))?;
+                into_destination(request, size, |out| {
+                    bcpack::decode(bc, &packed[..n], out, tables.expect("bc != 0"))
+                        .map(|()| out.len())
+                        .map_err(|e| fail(INVALID_DATA, &e.to_string()))
+                })
+            })
+        } else {
+            into_destination(request, size, |out| match tables {
+                Some(tables) => bcpack::decode(bc, source, out, tables)
+                    .map(|()| out.len())
+                    .map_err(|e| fail(INVALID_DATA, &e.to_string())),
+                None => inflate(source, out).map_err(|hr| fail(hr, "zlib")),
+            })
+        }
     })?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
@@ -1066,46 +1088,149 @@ fn load_bcpack_tables() -> Result<Tables, String> {
     Tables::parse(&bytes).map_err(|e| e.to_string())
 }
 
-/// A compressed request's source: borrowed from memory, or read from the
-/// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
+/// Maximum capacity retained per worker thread-local scratch buffer.
+const SCRATCH_CAP: usize = 8 << 20;
+
+fn with_src_buf<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    thread_local! {
+        static BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    BUF.with_borrow_mut(|buf| {
+        buf.clear();
+        buf.resize(size, 0);
+        let res = f(buf);
+        if buf.capacity() > SCRATCH_CAP {
+            *buf = Vec::new();
+        }
+        res
+    })
+}
+
+fn with_stage_buf<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    thread_local! {
+        static BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    BUF.with_borrow_mut(|buf| {
+        buf.clear();
+        buf.resize(size, 0);
+        let res = f(buf);
+        if buf.capacity() > SCRATCH_CAP {
+            *buf = Vec::new();
+        }
+        res
+    })
+}
+
+/// Runs `f` on a compressed request's source slice: borrowed from memory, or
+/// read from the file into a reusable thread-local buffer.
+fn with_source<R>(
+    request: &Request,
+    f: impl FnOnce(&[u8]) -> Result<R, HRESULT>,
+) -> Result<R, HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
         let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
-        return Ok(Cow::Borrowed(bytes));
+        return f(bytes);
     }
-    let mut bytes = vec![0; size];
-    read_into(request, &mut bytes)?;
-    Ok(Cow::Owned(bytes))
+    with_src_buf(size, |buf| {
+        read_into(request, buf)?;
+        f(buf)
+    })
 }
 
 /// Nanoseconds workers spent reading files, for the debug summary.
 static READING: AtomicU64 = AtomicU64::new(0);
 
-/// Fills `out` (the source size) from the request's file or memory.
+struct OverlappedEvent(windows_sys::Win32::Foundation::HANDLE);
+
+impl Drop for OverlappedEvent {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: event handle created for this thread via `CreateEventW`.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+        }
+    }
+}
+
+/// Fills `out` (the source size) from the request's file or memory using
+/// overlapped I/O so multiple workers can read the same file concurrently.
 fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
+    use windows_sys::Win32::Foundation::{ERROR_HANDLE_EOF, ERROR_IO_PENDING, HANDLE};
+    use windows_sys::Win32::Storage::FileSystem::ReadFile;
+    use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+    use windows_sys::Win32::System::Threading::{CreateEventW, ResetEvent};
+
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `out.len()` bytes until completion.
         out.copy_from_slice(unsafe { std::slice::from_raw_parts(request.source.cast(), out.len()) });
+        return Ok(());
+    }
+    if out.is_empty() {
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
     let file = &unsafe { &*request.source.cast::<Instance<File>>() }
         .state
         .file;
+    let handle = file.as_raw_handle() as HANDLE;
     let started = std::time::Instant::now();
-    let mut done = 0;
-    let result = loop {
-        if done == out.len() {
-            break Ok(());
+    thread_local! {
+        // SAFETY: manual-reset, non-signaled, unnamed event.
+        static IO_EVENT: OverlappedEvent = OverlappedEvent(unsafe {
+            CreateEventW(std::ptr::null(), 1, 0, std::ptr::null())
+        });
+    }
+    let result = IO_EVENT.with(|ev| {
+        let mut done = 0usize;
+        while done < out.len() {
+            let to_read = (out.len() - done).min(64 << 20) as u32;
+            let pos = request.offset + done as u64;
+            // SAFETY: plain C struct zero-initialized with offset and event set.
+            let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
+            ov.Anonymous.Anonymous.Offset = pos as u32;
+            ov.Anonymous.Anonymous.OffsetHigh = (pos >> 32) as u32;
+            ov.hEvent = ev.0;
+            if !ev.0.is_null() {
+                // SAFETY: manual-reset event owned by this thread.
+                unsafe { ResetEvent(ev.0) };
+            }
+            let mut n = 0u32;
+            // SAFETY: `out` is valid for `to_read` bytes from `done`, `ov` lives until completion.
+            let ok = unsafe {
+                ReadFile(
+                    handle,
+                    out.as_mut_ptr().add(done).cast(),
+                    to_read,
+                    &mut n,
+                    &mut ov,
+                )
+            };
+            if ok == 0 {
+                let err = std::io::Error::last_os_error();
+                match err.raw_os_error().map(|e| e as u32) {
+                    Some(e) if e == ERROR_IO_PENDING => {
+                        // SAFETY: `ov` belongs to this `ReadFile`; waits until done.
+                        let finished = unsafe { GetOverlappedResult(handle, &ov, &mut n, 1) };
+                        if finished == 0 {
+                            let gerr = std::io::Error::last_os_error();
+                            if gerr.raw_os_error() == Some(ERROR_HANDLE_EOF as i32) {
+                                return Err(END_OF_FILE);
+                            }
+                            return Err(from_win32(&gerr));
+                        }
+                    }
+                    Some(e) if e == ERROR_HANDLE_EOF => return Err(END_OF_FILE),
+                    _ => return Err(from_win32(&err)),
+                }
+            }
+            if n == 0 {
+                return Err(END_OF_FILE);
+            }
+            done += n as usize;
         }
-        match file.seek_read(&mut out[done..], request.offset + done as u64) {
-            Ok(0) => break Err(END_OF_FILE),
-            Ok(n) => done += n,
-            Err(error) => break Err(from_win32(&error)),
-        }
-    };
+        Ok(())
+    });
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     result
 }
@@ -1938,5 +2063,30 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn concurrent_overlapped_reads_and_staging_floor() {
+        let data = pattern(256 * 1024);
+        let (_dir, file) = file_with(&data);
+        let (queue, array) = (new_queue(0), status_array(1));
+        let mut bufs = vec![vec![0u8; 4096]; 16];
+        for (i, buf) in bufs.iter_mut().enumerate() {
+            let offset = (i * 13_331) % (data.len() - 4096);
+            enqueue(
+                queue,
+                &request(0, buf.as_mut_ptr().cast(), 4096, file, offset as u64, 4096),
+            );
+        }
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        for (i, buf) in bufs.iter().enumerate() {
+            let offset = (i * 13_331) % (data.len() - 4096);
+            assert_eq!(&buf[..], &data[offset..offset + 4096]);
+        }
+        assert_eq!(effective_staging(32 << 20), STAGING);
+        assert_eq!(effective_staging(128 << 20), 128 << 20);
+        void(queue, 0x40);
     }
 }

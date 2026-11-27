@@ -10,7 +10,7 @@
 //! the clock to presentation if a title paces by them.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -34,6 +34,66 @@ struct Clock {
 
 static CLOCK: Mutex<Option<Clock>> = Mutex::new(None);
 static FRAME: AtomicU64 = AtomicU64::new(0);
+static TARGET_INTERVAL_US: AtomicU64 = AtomicU64::new(16_667);
+static PRESENT_EPOCH: OnceLock<Instant> = OnceLock::new();
+static PRESENTED_COUNT: AtomicU64 = AtomicU64::new(0);
+static LAST_PRESENT_US: AtomicU64 = AtomicU64::new(0);
+static EMA_FRAME_US: AtomicU64 = AtomicU64::new(0);
+
+fn present_epoch_us() -> u64 {
+    PRESENT_EPOCH.get_or_init(Instant::now).elapsed().as_micros() as u64
+}
+
+/// Target frame interval set by the title (microseconds; defaults to 60 Hz).
+pub fn target_interval_us() -> u64 {
+    TARGET_INTERVAL_US.load(Ordering::Relaxed).max(1)
+}
+
+/// Records a completed presentation for adaptive A/V sync pacing.
+pub(crate) fn record_present() {
+    let now_us = present_epoch_us();
+    let prev = LAST_PRESENT_US.swap(now_us, Ordering::Relaxed);
+    PRESENTED_COUNT.fetch_add(1, Ordering::Relaxed);
+    if prev != 0 && now_us >= prev {
+        let dt = (now_us - prev).clamp(1_000, 2_000_000);
+        let ema = EMA_FRAME_US.load(Ordering::Relaxed);
+        let next = if ema == 0 {
+            dt
+        } else if dt > ema.saturating_mul(2) {
+            (ema + dt) / 2
+        } else {
+            (ema * 3 + dt) / 4
+        };
+        EMA_FRAME_US.store(next, Ordering::Relaxed);
+    }
+}
+
+/// Slowdown factor (>= 1.0) comparing actual rendered frame interval against
+/// `target_override_us` (or the title's `set_interval` target). Returns `1.0`
+/// before presentation begins or when frame times are within 25% of target.
+pub fn av_sync_slow_factor(target_override_us: Option<u64>) -> f64 {
+    if PRESENTED_COUNT.load(Ordering::Relaxed) < 2 {
+        return 1.0;
+    }
+    let target = target_override_us.unwrap_or_else(target_interval_us).max(1);
+    let ema = EMA_FRAME_US.load(Ordering::Relaxed);
+    let last = LAST_PRESENT_US.load(Ordering::Relaxed);
+    let since_last = if last != 0 {
+        present_epoch_us().saturating_sub(last).min(2_000_000)
+    } else {
+        0
+    };
+    compute_slow_factor(ema.max(since_last), target)
+}
+
+fn compute_slow_factor(effective_us: u64, target_us: u64) -> f64 {
+    let target = target_us.max(1);
+    if effective_us <= target.saturating_mul(5) / 4 {
+        1.0
+    } else {
+        (effective_us as f64 / target as f64).clamp(1.0, 20.0)
+    }
+}
 
 fn clock() -> std::sync::MutexGuard<'static, Option<Clock>> {
     CLOCK.lock().unwrap_or_else(|e| e.into_inner())
@@ -53,6 +113,7 @@ pub(crate) extern "system" fn set_interval(
         0 => SIXTIETH,
         us => Duration::from_micros(u64::from(us)),
     };
+    TARGET_INTERVAL_US.store(interval.as_micros() as u64, Ordering::Relaxed);
     tracing::info!(?interval, "frame interval");
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
@@ -248,5 +309,11 @@ mod tests {
         // Even when a flip wait begins on the tick another just ended on.
         let (tick, _) = next_tick(FLIP);
         assert!(tick > flips[3]);
+
+        // Slow-factor pacing thresholds and clamping.
+        assert_eq!(compute_slow_factor(16_667, 16_667), 1.0);
+        assert_eq!(compute_slow_factor(20_000, 16_667), 1.0);
+        assert!((compute_slow_factor(333_330, 33_333) - 10.0).abs() < 0.01);
+        assert_eq!(compute_slow_factor(5_000_000, 16_667), 20.0);
     }
 }

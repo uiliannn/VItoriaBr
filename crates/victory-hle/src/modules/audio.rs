@@ -20,7 +20,7 @@ use std::alloc::Layout;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::xasync::E_INVALIDARG;
 use super::xgameruntime::{HRESULT, S_OK};
@@ -34,6 +34,36 @@ const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Opt-in adaptive A/V sync slowdown factor (`VICTORY_AV_SYNC`):
+/// - unset or `0`: disabled (`1.0`, unthrottled real-time audio);
+/// - `1`: paces audio against the title's `set_interval` target;
+/// - integer >= 2 (e.g. `30`, `60`): paces against that target FPS.
+pub(crate) fn av_sync_slow_factor() -> f64 {
+    static MODE: OnceLock<Option<Option<u64>>> = OnceLock::new();
+    let mode = *MODE.get_or_init(|| {
+        let raw = std::env::var("VICTORY_AV_SYNC").ok()?;
+        let parsed = match raw.trim() {
+            "" | "0" => None,
+            "1" => Some(None),
+            other => match other.parse::<u64>() {
+                Ok(fps) if fps >= 2 => Some(Some(1_000_000 / fps)),
+                _ => None,
+            },
+        };
+        if let Some(target_override_us) = parsed {
+            tracing::info!(
+                ?target_override_us,
+                "audio: adaptive A/V sync pacing enabled (VICTORY_AV_SYNC)"
+            );
+        }
+        parsed
+    });
+    match mode {
+        None => 1.0,
+        Some(target_override_us) => victory_gpu::frame::av_sync_slow_factor(target_override_us),
+    }
 }
 
 // The APU heap.
@@ -329,6 +359,8 @@ struct Voice {
     /// Samples per channel still to drop (start or loop subframe skips).
     skip: usize,
     ended: bool,
+    /// Next wall-clock instant a block may be emitted when A/V sync throttles.
+    next_block_at: Option<Instant>,
     trace: Trace,
 }
 
@@ -427,6 +459,7 @@ impl Xma {
             pcm: VecDeque::new(),
             skip: context.field(1, 24, 3) as usize * xma::SUBFRAME_SAMPLES,
             ended: false,
+            next_block_at: None,
             trace: Trace {
                 since: Instant::now(),
                 produced: 0,
@@ -516,7 +549,22 @@ fn pump(context: Context, voice: &mut Voice) {
     if size == 0 {
         return;
     }
+    let slow = av_sync_slow_factor();
+    if slow <= 1.0 {
+        voice.next_block_at = None;
+    }
     while context.field(1, 31, 1) == 1 {
+        let now = if slow > 1.0 {
+            let now = Instant::now();
+            if let Some(deadline) = voice.next_block_at
+                && now < deadline
+            {
+                return;
+            }
+            Some(now)
+        } else {
+            None
+        };
         if voice.pcm.len() < SAMPLES_PER_BLOCK && !decode(context, voice) {
             return;
         }
@@ -530,7 +578,17 @@ fn pump(context: Context, voice: &mut Voice) {
             voice.trace.peak = voice.trace.peak.max(sample.saturating_abs());
             pair.copy_from_slice(&sample.to_le_bytes());
         }
-        voice.trace.produced += SAMPLES_PER_BLOCK / context.channels();
+        let channels = context.channels();
+        voice.trace.produced += SAMPLES_PER_BLOCK / channels;
+        if let Some(now) = now {
+            const RATES: [u32; 4] = [24_000, 32_000, 44_100, 48_000];
+            let rate = RATES[context.field(1, 27, 2) as usize];
+            let block_us = ((SAMPLES_PER_BLOCK / channels) as u64 * 1_000_000) / u64::from(rate);
+            let step = Duration::from_micros(((block_us as f64) * slow) as u64);
+            let min_base = now.checked_sub(Duration::from_millis(50)).unwrap_or(now);
+            let base = voice.next_block_at.unwrap_or(now).max(min_base);
+            voice.next_block_at = Some(base + step);
+        }
         let write = (write + 1) % size;
         context.set_field(0, 27, 5, write);
         // The read block is the title's: taken modulo the ring like the
@@ -666,8 +724,10 @@ fn wake_decoder() {
                 .spawn(|| {
                     loop {
                         xma().pump();
-                        // A 256-byte output block lasts 2.7 ms at 48 kHz mono.
-                        std::thread::park_timeout(std::time::Duration::from_millis(2));
+                        // A 256-byte output block lasts 2.7 ms at 48 kHz mono;
+                        // scale when A/V sync slows decoding below real time.
+                        let wait_ms = (2.0 * av_sync_slow_factor()).clamp(2.0, 16.0) as u64;
+                        std::thread::park_timeout(Duration::from_millis(wait_ms));
                     }
                 })
                 .map_or_else(|_| std::thread::current(), |h| h.thread().clone())
@@ -728,16 +788,27 @@ struct State {
     capacity: usize,
     /// Messages lost to a full queue since the last one queued.
     dropped: u32,
-    since: Instant,
+    virtual_usec: u64,
+    last_wall: Instant,
 }
 
 impl State {
-    fn usec(&self) -> u64 {
-        self.since.elapsed().as_micros() as u64
+    fn advance_usec(&mut self) -> u64 {
+        let now = Instant::now();
+        let dt_us = now.saturating_duration_since(self.last_wall).as_micros() as u64;
+        self.last_wall = now;
+        let slow = av_sync_slow_factor();
+        let scaled = if slow <= 1.0 {
+            dt_us
+        } else {
+            (dt_us as f64 / slow) as u64
+        };
+        self.virtual_usec = self.virtual_usec.saturating_add(scaled);
+        self.virtual_usec
     }
 
-    fn frame(&self) -> u32 {
-        (self.usec() * FRAMES_PER_SECOND / 1_000_000) as u32
+    fn frame(usec: u64) -> u32 {
+        (usec * FRAMES_PER_SECOND / 1_000_000) as u32
     }
 
     /// Queues a registered message; a full queue drops it and counts it in
@@ -751,10 +822,11 @@ impl State {
             tracing::debug!(kind, dropped = self.dropped, "coprocessor message dropped");
             return;
         }
+        let usec = self.advance_usec() as u32;
         let mut message = Message {
             kind,
             dropped: std::mem::take(&mut self.dropped),
-            usec: self.usec() as u32,
+            usec,
             data: [0; 16],
         };
         message.data[..data.len()].copy_from_slice(data);
@@ -849,10 +921,11 @@ extern "system" fn submit(
         _ => {}
     }
     if id != 0 {
+        let frame = State::frame(state.advance_usec());
         let mut done = [0u8; 16];
         done[..4].copy_from_slice(&command.to_le_bytes());
         done[4..12].copy_from_slice(&id.to_le_bytes());
-        done[12..].copy_from_slice(&state.frame().to_le_bytes());
+        done[12..].copy_from_slice(&frame.to_le_bytes());
         state.post(COMMAND_COMPLETED, &done);
     }
     if notification != 0
@@ -896,7 +969,8 @@ pub extern "system" fn AcpHalCreate(out: *mut *mut Acp) -> HRESULT {
             messages: VecDeque::new(),
             capacity: 0,
             dropped: 0,
-            since: Instant::now(),
+            virtual_usec: 0,
+            last_wall: Instant::now(),
         }),
     });
     // SAFETY: checked non-null.

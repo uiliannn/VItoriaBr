@@ -274,20 +274,32 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
         _ => (&[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4], 2),
     };
     let stride = widths.len() * per;
-    let mut records = vec![0u8; blocks * stride];
-    let mut next = src.iter().copied();
-    lanes(tables, widths, per, blocks, |_| next.next(), &mut records)?;
-    let records = records.chunks_exact(stride);
-    let out = dst.chunks_exact_mut(block);
-    let t = tables;
-    match bc {
-        1 => plain(records, out, &t.bc1, &BC1, |s| bc1_residual(t, s), bc1_pack),
-        3 => plain(records, out, &t.bc3, &BC3, |s| bc3_residual(t, s), bc3_pack),
-        4 => plain(records, out, &t.bc4, &BC4, |s| bc4_residual(t, s), bc4_pack),
-        5 => plain(records, out, &t.bc5, &BC5, |s| bc5_residual(t, s), bc5_pack),
-        6 => bc6(records, out, &t.bc6),
-        _ => bc7(records, out, t),
+    let needed = blocks * stride;
+    thread_local! {
+        static RECORDS: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
+    RECORDS.with_borrow_mut(|records| {
+        records.clear();
+        records.resize(needed, 0);
+        let mut next = src.iter().copied();
+        lanes(tables, widths, per, blocks, |_| next.next(), records)?;
+        let iter = records.chunks_exact(stride);
+        let out = dst.chunks_exact_mut(block);
+        let t = tables;
+        let res = match bc {
+            1 => plain(iter, out, &t.bc1, &BC1, |s| bc1_residual(t, s), bc1_pack),
+            3 => plain(iter, out, &t.bc3, &BC3, |s| bc3_residual(t, s), bc3_pack),
+            4 => plain(iter, out, &t.bc4, &BC4, |s| bc4_residual(t, s), bc4_pack),
+            5 => plain(iter, out, &t.bc5, &BC5, |s| bc5_residual(t, s), bc5_pack),
+            6 => bc6(iter, out, &t.bc6),
+            _ => bc7(iter, out, t),
+        };
+        const CAP: usize = 8 << 20;
+        if records.capacity() > CAP {
+            *records = Vec::new();
+        }
+        res
+    })
 }
 
 // Lanes.
