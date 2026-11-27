@@ -254,4 +254,95 @@ mod tests {
         let data = tmp.path().join("data");
         assert!(resolve_dirs(&data.join("cache"), &data).is_ok());
     }
+
+    #[cfg(windows)]
+    mod missing_windows_dirs {
+        use super::*;
+        use std::fs;
+
+        fn temp_with_case_probe(name: &str, alias: &str, expect_alias: bool) -> tempfile::TempDir {
+            let tmp = tempfile::tempdir().unwrap();
+            let parent = tmp.path();
+            assert!(parent.is_absolute() && parent.is_dir());
+            let probe = parent.join(name);
+            fs::create_dir(&probe).unwrap();
+            assert_eq!(
+                parent.join(alias).try_exists().unwrap(),
+                expect_alias,
+                "unexpected case behavior for {name} and {alias} in {}",
+                parent.display()
+            );
+            fs::remove_dir(probe).unwrap();
+            tmp
+        }
+
+        fn check_missing_dirs(
+            parent: &Path,
+            cache_name: &str,
+            data_name: &str,
+            expect_overlap: bool,
+        ) {
+            let cache = parent.join(cache_name);
+            let data = parent.join(data_name);
+            assert!(!cache.try_exists().unwrap() && !data.try_exists().unwrap());
+            assert!(fs::read_dir(parent).unwrap().next().is_none());
+
+            let result = resolve_dirs(&cache, &data);
+            // Check before inspecting the result, including when an expected rejection is missing.
+            assert!(
+                fs::read_dir(parent).unwrap().next().is_none(),
+                "configuration created an entry in {}",
+                parent.display()
+            );
+            if expect_overlap {
+                let error = result.expect_err("accepted overlapping cache and data directories");
+                let diagnostic = format!(
+                    "data_dir ({}) must not be the cache_dir ({}) or inside it",
+                    data.display(),
+                    cache.display()
+                );
+                assert!(error.to_string().starts_with(&diagnostic), "{error}");
+            } else {
+                result.unwrap();
+            }
+        }
+
+        #[test]
+        fn rejects_equal_dirs_with_different_case() {
+            let tmp = temp_with_case_probe("case-probe", "CASE-PROBE", true);
+            check_missing_dirs(tmp.path(), "cache", "CACHE", true);
+        }
+
+        #[test]
+        fn rejects_descendant_with_different_case() {
+            let tmp = temp_with_case_probe("case-probe", "CASE-PROBE", true);
+            check_missing_dirs(tmp.path(), "cache", "CACHE/saves", true);
+        }
+
+        #[test]
+        fn rejects_descendant_with_equivalent_unicode_case() {
+            let tmp = temp_with_case_probe("probe-depósito", "PROBE-DEPÓSITO", true);
+            check_missing_dirs(tmp.path(), "depósito", "DEPÓSITO/saves", true);
+        }
+
+        #[test]
+        fn accepts_sibling_with_similar_name() {
+            let tmp = temp_with_case_probe("case-probe", "CASE-PROBE", true);
+            check_missing_dirs(tmp.path(), "cache", "CACHE-old/saves", false);
+        }
+
+        #[test]
+        fn rejects_same_case_descendant_without_creating_dirs() {
+            let tmp = temp_with_case_probe("case-probe", "CASE-PROBE", true);
+            check_missing_dirs(tmp.path(), "cache", "cache/saves", true);
+        }
+
+        #[test]
+        #[ignore = "requires a case-sensitive Windows temporary directory"]
+        fn respects_case_sensitive_parent() {
+            let tmp = temp_with_case_probe("case-probe", "CASE-PROBE", false);
+            check_missing_dirs(tmp.path(), "cache", "CACHE/saves", false);
+            check_missing_dirs(tmp.path(), "cache", "cache/saves", true);
+        }
+    }
 }
