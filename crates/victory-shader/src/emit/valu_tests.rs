@@ -1062,6 +1062,64 @@ fn bfe_signed_and_unsigned_match_rdna2() {
 }
 
 #[test]
+fn v_frexp_split_floats_like_c_frexp() {
+    // (input bits, significand bits, exponent): x = significand * 2^exp
+    // with the significand in [0.5, 1); denormals are normalized; zero,
+    // infinity and NaN keep their bits and have exponent 0.
+    let f = f32::to_bits;
+    let f32_cases: &[(u32, u32, i32)] = &[
+        (f(8.0), f(0.5), 4),
+        (f(-3.0), f(-0.75), 2),
+        (f(0.75), f(0.75), 0),
+        (f(1.0), f(0.5), 1),
+        (f32::MAX.to_bits(), 0x3F7F_FFFF, 128),
+        (0x0080_0000, f(0.5), -125), // smallest normal
+        (0x0000_0001, f(0.5), -148), // smallest denormal
+        (0x8000_0003, f(-0.75), -147),
+        (0x0040_0000, f(0.5), -126),
+        (0, 0, 0),
+        (0x8000_0000, 0x8000_0000, 0),
+        (0x7F80_0000, 0x7F80_0000, 0),
+        (0x7FC0_0000, 0x7FC0_0000, 0),
+    ];
+    let mant = build_valu_cs(&[vop1(0x040, 0, vgpr(1))]);
+    let exp = build_valu_cs(&[vop1(0x03F, 0, vgpr(1))]);
+    let inputs: Vec<[u32; 4]> = f32_cases.iter().map(|c| [c.0, 0, 0, 0]).collect();
+    run_cases(&mant, &inputs, |backend, i, _, got| {
+        let (x, want, _) = f32_cases[i];
+        assert_eq!(got, want, "{backend}: v_frexp_mant_f32({x:#010x}) = {got:#010x}, want {want:#010x}");
+    });
+    run_cases(&exp, &inputs, |backend, i, _, got| {
+        let (x, _, want) = f32_cases[i];
+        assert_eq!(got as i32, want, "{backend}: v_frexp_exp_i32_f32({x:#010x}) = {}", got as i32);
+    });
+
+    // f16: both write v0's low half and keep its high half (0).
+    let f16_cases: &[(u32, u32, i16)] = &[
+        (0x4800, 0x3800, 4),  // 8.0
+        (0xC200, 0xBA00, 2),  // -3.0 -> -0.75
+        (0x7BFF, 0x3BFF, 16), // 65504
+        (0x0400, 0x3800, -13),
+        (0x0001, 0x3800, -23), // the smallest denormal
+        (0x8000, 0x8000, 0),
+        (0x7C00, 0x7C00, 0),
+        (0x7E00, 0x7E00, 0),
+    ];
+    let mant = build_valu_cs(&[vop1(0x059, 0, vgpr(1))]);
+    let exp = build_valu_cs(&[vop1(0x05A, 0, vgpr(1))]);
+    let inputs: Vec<[u32; 4]> = f16_cases.iter().map(|c| [c.0, 0, 0, 0]).collect();
+    run_cases(&mant, &inputs, |backend, i, _, got| {
+        let (x, want, _) = f16_cases[i];
+        assert_eq!(got, want, "{backend}: v_frexp_mant_f16({x:#06x}) = {got:#010x}, want {want:#06x}");
+    });
+    run_cases(&exp, &inputs, |backend, i, _, got| {
+        let (x, _, want) = f16_cases[i];
+        let want = u32::from(want as u16);
+        assert_eq!(got, want, "{backend}: v_frexp_exp_i16_f16({x:#06x}) = {got:#010x}, want {want:#06x}");
+    });
+}
+
+#[test]
 fn f16_omod_applies_before_clamp() {
     // VOP3 v_add_f16 (0x132 = 0x100 + VOP2 0x32): v0 = (v1 + v2) * omod [clamp]
     let mul2 = build_valu_cs(&vop3_mod(0x132, 0, vgpr(1), vgpr(2), 0, 0, 0, 1, false));

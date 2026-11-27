@@ -7306,6 +7306,17 @@ impl<'a> Lower<'a> {
                 }
                 Ok(())
             }
+            "v_frexp_mant_f32" | "v_frexp_exp_i32_f32" => {
+                let a = f(self, 0)?;
+                let bits = self.as_int(a);
+                let (mant, exp) = self.frexp(bits, false);
+                if name == "v_frexp_mant_f32" {
+                    let m = self.as_float(mant);
+                    float(self, m)
+                } else {
+                    int(self, exp)
+                }
+            }
             "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => {
                 let n = s(self, 0)?;
                 let x = self.src64(inst, 1)?;
@@ -8135,6 +8146,59 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// C's `frexp` of the f32 (or, with `half`, f16 in the low bits) `bits`,
+    /// as RDNA2's v_frexp_mant/v_frexp_exp define it: the significand's
+    /// bits, in [0.5, 1) with the input's sign, and the exponent, so that
+    /// x = significand * 2^exponent. A denormal is normalized first. Zero
+    /// keeps its bits and has exponent 0; so do infinities and NaNs (AMD's
+    /// ISA: D = S0 and exponent 0 for them).
+    fn frexp(&mut self, bits: V, half: bool) -> (V, V) {
+        let c = self.cur;
+        // (significand bits, exponent field mask, field of 0.5, sign bit)
+        let (man, field, half_e, sign) =
+            if half { (10, 0x1F, 14, 0x8000) } else { (23, 0xFF, 126, 0x8000_0000) };
+        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+        let sign_mask = k(self, sign);
+        let s = self.s.m.bin(c, Bin::And, bits, sign_mask);
+        let mag_mask = k(self, sign - 1);
+        let mag = self.s.m.bin(c, Bin::And, bits, mag_mask);
+        let kman = k(self, man);
+        let e = self.s.m.bin(c, Bin::LShr, mag, kman);
+        let man_mask = k(self, (1 << man) - 1);
+        let kh = k(self, half_e);
+        let half_field = self.s.m.bin(c, Bin::Shl, kh, kman);
+        // Normal: the field becomes 0.5's, the exponent e - (bias - 1).
+        let m = self.s.m.bin(c, Bin::And, mag, man_mask);
+        let normal_m = self.s.m.bin(c, Bin::Or, m, half_field);
+        let normal_e = self.s.m.bin(c, Bin::Sub, e, kh);
+        // Denormal: the leading one (bit 31 - lz) moves to the implicit
+        // bit, and the exponent is that bit's place less the denormal
+        // scale (2^-149 or 2^-24) plus one.
+        let lz = self
+            .s
+            .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, 33, &[mag]);
+        let up = k(self, 31 - man);
+        let shift = self.s.m.bin(c, Bin::Sub, lz, up);
+        let moved = self.s.m.bin(c, Bin::Shl, mag, shift);
+        let moved = self.s.m.bin(c, Bin::And, moved, man_mask);
+        let denormal_m = self.s.m.bin(c, Bin::Or, moved, half_field);
+        let top = k(self, if half { 8 } else { (-117i32) as u32 });
+        let denormal_e = self.s.m.bin(c, Bin::Sub, top, lz);
+        let zero = k(self, 0);
+        let is_denormal = self.s.m.cmp(c, pred::EQ, e, zero);
+        let mm = self.s.m.select(c, is_denormal, denormal_m, normal_m);
+        let ee = self.s.m.select(c, is_denormal, denormal_e, normal_e);
+        let mm = self.s.m.bin(c, Bin::Or, mm, s);
+        // Zero, infinity and NaN: the input, exponent 0.
+        let is_zero = self.s.m.cmp(c, pred::EQ, mag, zero);
+        let kf = k(self, field);
+        let special = self.s.m.cmp(c, pred::EQ, e, kf);
+        let keep = self.s.m.bin(c, Bin::Or, is_zero, special);
+        let mm = self.s.m.select(c, keep, bits, mm);
+        let ee = self.s.m.select(c, keep, zero, ee);
+        (mm, ee)
+    }
+
     /// A 64-bit source (a register pair; inline constants sign-extend).
     fn src64(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
@@ -8530,6 +8594,8 @@ impl<'a> Lower<'a> {
         ];
         const FLOAT1: &[&str] = &[
             "v_rcp_f16",
+            "v_frexp_mant_f16",
+            "v_frexp_exp_i16_f16",
             "v_sqrt_f16",
             "v_rsq_f16",
             "v_log_f16",
@@ -8665,6 +8731,32 @@ impl<'a> Lower<'a> {
                 _ => self.med3(a, b, acc),
             };
             return float_result(self, r);
+        }
+        if matches!(name, "v_frexp_mant_f16" | "v_frexp_exp_i16_f16") {
+            // The f16's bits, with abs and neg applied to its sign.
+            let mut h = self.half_src(inst, 0)?;
+            if v.abs & 1 != 0 {
+                let m = self.s.m.i32(0x7FFF);
+                h = self.s.m.bin(self.cur, Bin::And, h, m);
+            }
+            if v.neg & 1 != 0 {
+                let m = self.s.m.i32(0x8000);
+                h = self.s.m.bin(self.cur, Bin::Xor, h, m);
+            }
+            let (mant, exp) = self.frexp(h, true);
+            if name == "v_frexp_exp_i16_f16" {
+                if v.clamp || v.omod != 0 {
+                    return Err("modifiers on a 16-bit integer operation");
+                }
+                return self.write_half(inst, exp, guard);
+            }
+            if v.clamp || v.omod != 0 {
+                let f = self
+                    .s
+                    .op(self.cur, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[mant]);
+                return float_result(self, f);
+            }
+            return self.write_half(inst, mant, guard);
         }
         if float1.contains(&name) {
             let r = match name {
@@ -11297,6 +11389,55 @@ mod tests {
             mesh_stride: 0,
         })
         .map(|_| ())
+    }
+
+    /// `v_frexp_mant_f32`, `v_frexp_exp_i32_f32`, `v_frexp_mant_f16` and
+    /// `v_frexp_exp_i16_f16` decode (VOP1 and VOP3) and translate in a
+    /// program that stores the result.
+    #[test]
+    fn frexp_translates() {
+        let program = |body: [u32; 2]| {
+            let mut words = vec![
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0xFA00_0000,
+            ];
+            // v_mov_b32 v1..v4, s0..s3
+            words.extend((0..4u32).map(|i| 0x7E00_0200 | (i + 1) << 17 | i));
+            words.extend(body);
+            words.extend([0xE070_0000, 0x8002_0000, S_ENDPGM]); // buffer_store_dword v0
+            words
+        };
+        let buffer = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let constants = RootParam { sgprs: 4, ..root(RootType::Constants, 0, 0) };
+        for (op, name) in [
+            (0x40, "v_frexp_mant_f32"),
+            (0x3F, "v_frexp_exp_i32_f32"),
+            (0x59, "v_frexp_mant_f16"),
+            (0x5A, "v_frexp_exp_i16_f16"),
+        ] {
+            // VOP1 (v_nop after it), then VOP3 (opcode 0x180 + VOP1's).
+            let vop1 = [0x7E00_0000 | op << 9 | 0x101, 0x7E00_0000];
+            let vop3 = [0xD400_0000 | (0x180 + op) << 16, 0x101];
+            for body in [vop1, vop3] {
+                let code: Vec<u8> = program(body).iter().flat_map(|w| w.to_le_bytes()).collect();
+                let insts = crate::gfx10::decode(&code).unwrap();
+                let names: Vec<_> = insts.iter().map(|i| i.name()).collect();
+                assert!(names.contains(&Some(name)), "{names:?}");
+                let layout = vec![constants, root(RootType::Table, 4, 1)];
+                lower_with(&program(body), layout, vec![buffer])
+                    .unwrap_or_else(|e| panic!("{name} {body:08x?}: {e}"));
+            }
+        }
     }
 
     /// Lowers a compute program with the root parameters `layout` (in user
