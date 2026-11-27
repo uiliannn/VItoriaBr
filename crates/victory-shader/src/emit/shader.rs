@@ -879,6 +879,8 @@ impl Shader {
 
         let bitcode = self.m.write();
         super::bitcode::census::note(&self.m, &bitcode);
+        #[cfg(test)]
+        super::llvm_verify::check(&bitcode);
         let mut dxil = Vec::with_capacity(24 + bitcode.len());
         dxil.extend((kind << 16 | 0x66).to_le_bytes());
         dxil.extend((((24 + bitcode.len()) / 4) as u32).to_le_bytes());

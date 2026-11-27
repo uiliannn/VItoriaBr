@@ -50,5 +50,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
         run: cargo clippy $PORTABLE --all-targets --locked -- -D warnings
+      # With LLVM's verifier over every module the shader tests emit
+      # (crates/victory-shader/src/emit/llvm_verify.rs), through the newest
+      # opt the runner image has, if any.
       - name: Tests
-        run: cargo test $PORTABLE --locked
+        run: |
+          export VICTORY_LLVM_OPT=$(ls /usr/bin/opt /usr/lib/llvm-*/bin/opt 2>/dev/null | sort -V | tail -n 1)
+          echo "VICTORY_LLVM_OPT=${VICTORY_LLVM_OPT:-none}"
+          if [ -n "$VICTORY_LLVM_OPT" ]; then "$VICTORY_LLVM_OPT" --version | head -n 2; fi
+          cargo test $PORTABLE --locked
