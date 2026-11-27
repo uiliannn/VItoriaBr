@@ -333,10 +333,10 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 
 fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
-    let dxil = c
-        .part(FourCC::DXIL)
-        .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
+    if c.part(FourCC::DXIL).is_none() && c.part(FourCC::ACCC).is_none() {
+        return Err(ShaderError::Malformed("no DXIL or ACCC part"));
+    }
+    let native = crate::container_programs(&c)?
         .into_iter()
         .find(|p| {
             matches!(
@@ -2363,6 +2363,381 @@ mod lds_bounds_tests {
                     "dword past program LDS must not leak halves counter"
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod accc_tests {
+    use super::*;
+
+    #[test]
+    fn translates_accc_fspx_compute_container() {
+        // Real FSPX layout: s4 = UAV table (slot 0, u11 at offset 0x58 = 88 dwords = 0x160 bytes),
+        // RDNA2 compute code writing lane id v0 into u11[v0].
+        let mut code_words = vec![
+            0xBE8A_0304u32, // s_mov_b32 s10, s4
+            0xBE8B_0380,    // s_mov_b32 s11, 0
+            0xF408_0405,    // s_load_dwordx4 s[16:19], s[10:11], 0x160
+            0xFA00_0160,
+            0xBF8C_C07F,    // s_waitcnt lgkmcnt(0)
+            0x3402_0082,    // v_lshlrev_b32 v1, 2, v0
+            0xE070_1000,    // buffer_store_dword v0, v1, s[16:19], 0 offen
+            0x8004_0001,
+            0xBF81_0000,    // s_endpgm
+        ];
+        // Prepend the 9-dword FSPX v_nop/s_branch metadata header just like real FSPX shaders.
+        let mut prefixed = vec![
+            0xD580_49BB,
+            0x03FF_51CC,
+            0xC180_2709,
+            0xD580_89BD,
+            0x03FE_3B92,
+            0x170B_C626,
+            0xD580_0000,
+            0x03FE_0100,
+            0x0000_0AC0,
+            0xBFA0_0003, // s_branch +3 -> wait, skips 3 dwords; in real FSPX it jumps over nothing or trailing pad
+        ];
+        // Note: s_branch +3 from word 9 (0x24) lands at 0x24 + 4 + 12 = 0x34 (word 13), so pad 3 s_nop words.
+        prefixed.extend([0xBF80_0000; 3]);
+        prefixed.append(&mut code_words);
+        let code: Vec<u8> = prefixed.iter().flat_map(|w| w.to_le_bytes()).collect();
+
+        for (wave32, threads, rsrc1, rsrc2) in [
+            (true, [32u16, 1, 1], 0x402c_0341u32, 0x0000_009cu32),
+            (false, [64u16, 1, 1], 0x402c_0349u32, 0x0000_0190u32),
+        ] {
+            let mut meta = vec![0u8; 28];
+            meta[0..4].copy_from_slice(&0x4005_cf00u32.to_le_bytes());
+            meta[4..8].copy_from_slice(&0x6c09_0102u32.to_le_bytes());
+            meta[12..14].copy_from_slice(&threads[0].to_le_bytes());
+            meta[14..16].copy_from_slice(&threads[1].to_le_bytes());
+            meta[16..18].copy_from_slice(&threads[2].to_le_bytes());
+            if wave32 {
+                meta[18..20].copy_from_slice(&0x0010u16.to_le_bytes());
+            }
+            meta[20..24].copy_from_slice(&rsrc1.to_le_bytes());
+            meta[24..28].copy_from_slice(&rsrc2.to_le_bytes());
+            let info = [0u8; 20];
+            let mut bindings = Vec::new();
+            bindings.extend_from_slice(&0x403u32.to_le_bytes());
+            bindings.extend_from_slice(&(4u32 + 32).to_le_bytes());
+            bindings.extend_from_slice(&((prefixed.len()) as u32).to_le_bytes());
+            bindings.extend_from_slice(&0u64.to_le_bytes());
+            bindings.extend_from_slice(&((8u32 << 12) | 0x440).to_le_bytes());
+            for w in [0x41u32, 0x0303, 0x58, 11, 1, 0x0000_0404, u32::MAX, 0] {
+                bindings.extend_from_slice(&w.to_le_bytes());
+            }
+
+            let mut fspx = Vec::new();
+            fspx.extend_from_slice(b"FSPX");
+            fspx.extend_from_slice(&1u32.to_le_bytes());
+            fspx.extend_from_slice(&4u32.to_le_bytes());
+            let sec0_off = 0x50u32;
+            let sec1_off = sec0_off + meta.len() as u32;
+            let sec6_off = (sec1_off + info.len() as u32).next_multiple_of(16);
+            let sec7_off = sec6_off + code.len() as u32;
+            let total = sec7_off + bindings.len() as u32;
+            fspx.extend_from_slice(&total.to_le_bytes());
+            for (kind, off, sz) in [
+                (0u32, sec0_off, meta.len() as u32),
+                (1u32, sec1_off, info.len() as u32),
+                (6u32, sec6_off, code.len() as u32),
+                (7u32, sec7_off, bindings.len() as u32),
+            ] {
+                fspx.extend_from_slice(&kind.to_le_bytes());
+                fspx.extend_from_slice(&off.to_le_bytes());
+                fspx.extend_from_slice(&sz.to_le_bytes());
+                fspx.extend_from_slice(&0u32.to_le_bytes());
+            }
+            fspx.resize(sec0_off as usize, 0);
+            fspx.extend_from_slice(&meta);
+            fspx.extend_from_slice(&info);
+            fspx.resize(sec6_off as usize, 0);
+            fspx.extend_from_slice(&code);
+            fspx.extend_from_slice(&bindings);
+
+            let dxbc = crate::dxbc::build(&[
+                (FourCC::SFI0, &[0; 8]),
+                (FourCC::ISG1, &[0; 8]),
+                (FourCC::OSG1, &[0; 8]),
+                (FourCC::ACCC, &fspx),
+            ]);
+            let host = translate(&dxbc).expect("FSPX compute container should translate");
+            assert_eq!(host.stage, HwStage::Cs);
+            assert_eq!(host.user_data.len(), 1);
+            assert_eq!(host.user_data[0].index, 4);
+            assert_eq!(host.user_data[0].slot, 0);
+            assert_eq!(host.user_data[0].root, RootType::Table);
+            #[cfg(windows)]
+            if let Ok(mut v) =
+                validator::Validator::load(validator::Validator::default_path().as_deref())
+            {
+                v.validate(&mut host.dxil.clone()).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn translates_accc_fspx_with_aco_raw_buffer_and_pk_fmac() {
+        // Exercises the real FSPX opcodes observed in amd_fidelityfx_upscaler_xbox.dll:
+        // s_load_dwordx4 + ACO raw-buffer normalization (s_bfe_u32 / s_mul_i32 /
+        // s_and_b32 0xc000ffff / s_and_b32 0xcfffffff / s_or_b32 0x30000000) and
+        // VOP2 v_pk_fmac_f16.
+        let code_words: Vec<u32> = vec![
+            0xBE88_0304, // s_mov_b32 s8, s4
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xF408_0204, // s_load_dwordx4 s[8:11], s[8:9], 0x40
+            0xFA00_0040,
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x938C_FF09, // s_bfe_u32 s12, s9, 0x000e0010
+            0x000E_0010,
+            0x848C_810C, // s_add_u32 s12, s12, 1
+            0x870B_FF0B, // s_and_b32 s11, s11, 0xcfffffff
+            0xCFFF_FFFF,
+            0x930A_0C0A, // s_mul_i32 s10, s10, s12
+            0x880B_FF0B, // s_or_b32 s11, s11, 0x30000000
+            0x3000_0000,
+            0x8709_FF09, // s_and_b32 s9, s9, 0xc000ffff
+            0xC000_FFFF,
+            0xE030_0000, // buffer_load_dword v1, v0, s[8:11], 0 offen
+            0x8002_0100,
+            0xBF8C_0F70, // s_waitcnt vmcnt(0)
+            0x7802_0280, // v_pk_fmac_f16 v1, 0, v1
+            0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+            0xE070_1000, // buffer_store_dword v1, v2, s[8:11], 0 offen
+            0x8002_0102,
+            0xBF81_0000, // s_endpgm
+        ];
+        let code: Vec<u8> = code_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut meta = vec![0u8; 28];
+        meta[0..4].copy_from_slice(&0x4005_cf00u32.to_le_bytes());
+        meta[4..8].copy_from_slice(&0x6c09_0102u32.to_le_bytes());
+        meta[12..14].copy_from_slice(&32u16.to_le_bytes());
+        meta[14..16].copy_from_slice(&1u16.to_le_bytes());
+        meta[16..18].copy_from_slice(&1u16.to_le_bytes());
+        meta[18..20].copy_from_slice(&0x0010u16.to_le_bytes());
+        meta[20..24].copy_from_slice(&0x402c_0341u32.to_le_bytes());
+        meta[24..28].copy_from_slice(&0x0000_009cu32.to_le_bytes());
+        let info = [0u8; 20];
+        let mut bindings = Vec::new();
+        bindings.extend_from_slice(&0x403u32.to_le_bytes());
+        bindings.extend_from_slice(&(4u32 + 32).to_le_bytes());
+        bindings.extend_from_slice(&(code_words.len() as u32).to_le_bytes());
+        bindings.extend_from_slice(&0u64.to_le_bytes());
+        bindings.extend_from_slice(&((8u32 << 12) | 0x440).to_le_bytes());
+        for w in [0x41u32, 0x0303, 0x10, 2, 1, 0x0000_0404, u32::MAX, 0] {
+            bindings.extend_from_slice(&w.to_le_bytes());
+        }
+        let sec0_off = 0x50u32;
+        let sec1_off = sec0_off + meta.len() as u32;
+        let sec6_off = (sec1_off + info.len() as u32).next_multiple_of(16);
+        let sec7_off = sec6_off + code.len() as u32;
+        let total = sec7_off + bindings.len() as u32;
+        let mut fspx = Vec::new();
+        fspx.extend_from_slice(b"FSPX");
+        fspx.extend_from_slice(&1u32.to_le_bytes());
+        fspx.extend_from_slice(&4u32.to_le_bytes());
+        fspx.extend_from_slice(&total.to_le_bytes());
+        for (kind, off, sz) in [
+            (0u32, sec0_off, meta.len() as u32),
+            (1u32, sec1_off, info.len() as u32),
+            (6u32, sec6_off, code.len() as u32),
+            (7u32, sec7_off, bindings.len() as u32),
+        ] {
+            fspx.extend_from_slice(&kind.to_le_bytes());
+            fspx.extend_from_slice(&off.to_le_bytes());
+            fspx.extend_from_slice(&sz.to_le_bytes());
+            fspx.extend_from_slice(&0u32.to_le_bytes());
+        }
+        fspx.resize(sec0_off as usize, 0);
+        fspx.extend_from_slice(&meta);
+        fspx.extend_from_slice(&info);
+        fspx.resize(sec6_off as usize, 0);
+        fspx.extend_from_slice(&code);
+        fspx.extend_from_slice(&bindings);
+
+        let dxbc = crate::dxbc::build(&[
+            (FourCC::SFI0, &[0; 8]),
+            (FourCC::ISG1, &[0; 8]),
+            (FourCC::OSG1, &[0; 8]),
+            (FourCC::ACCC, &fspx),
+        ]);
+        let host = translate(&dxbc).expect("FSPX compute container should translate");
+        assert_eq!(host.stage, HwStage::Cs);
+        assert_eq!(host.user_data.len(), 3);
+        assert!(
+            host.user_data
+                .iter()
+                .any(|u| u.index == 4 && u.slot == 0 && u.root == RootType::Table)
+        );
+        #[cfg(windows)]
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut host.dxil.clone()).unwrap();
+        }
+    }
+
+    #[test]
+    fn translates_accc_fspx_scc_some_into_s_cselect_b64() {
+        let code_words: Vec<u32> = vec![
+            0x7D0A_0081, // v_cmp_ne_i32 vcc, 1, v0
+            0x8792_7E6A, // s_and_b64 s[18:19], vcc, exec
+            0x8592_80C1, // s_cselect_b64 s[18:19], -1, 0
+            0xBF03_8080, // s_cmp_ge_u32 0, 0
+            0x8594_80C1, // s_cselect_b64 s[20:21], -1, 0
+            0x8B92_1214, // s_orn2_b64 s[18:19], s[20:21], s[18:19]
+            0xBF84_0001, // s_cbranch_scc0 +1
+            0xBF80_0000, // s_nop 0
+            0xBF81_0000, // s_endpgm
+        ];
+        let code: Vec<u8> = code_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut meta = vec![0u8; 28];
+        meta[0..4].copy_from_slice(&0x4005_cf00u32.to_le_bytes());
+        meta[4..8].copy_from_slice(&0x6c09_0102u32.to_le_bytes());
+        meta[12..14].copy_from_slice(&64u16.to_le_bytes());
+        meta[14..16].copy_from_slice(&1u16.to_le_bytes());
+        meta[16..18].copy_from_slice(&1u16.to_le_bytes());
+        meta[20..24].copy_from_slice(&0x402c_0349u32.to_le_bytes());
+        meta[24..28].copy_from_slice(&0x0000_0190u32.to_le_bytes());
+        let info = [0u8; 20];
+        let mut bindings = Vec::new();
+        bindings.extend_from_slice(&0x403u32.to_le_bytes());
+        bindings.extend_from_slice(&4u32.to_le_bytes());
+        bindings.extend_from_slice(&(code_words.len() as u32).to_le_bytes());
+        bindings.extend_from_slice(&0u64.to_le_bytes());
+        bindings.extend_from_slice(&0x440u32.to_le_bytes());
+        let sec0_off = 0x50u32;
+        let sec1_off = sec0_off + meta.len() as u32;
+        let sec6_off = (sec1_off + info.len() as u32).next_multiple_of(16);
+        let sec7_off = sec6_off + code.len() as u32;
+        let total = sec7_off + bindings.len() as u32;
+        let mut fspx = Vec::new();
+        fspx.extend_from_slice(b"FSPX");
+        fspx.extend_from_slice(&1u32.to_le_bytes());
+        fspx.extend_from_slice(&4u32.to_le_bytes());
+        fspx.extend_from_slice(&total.to_le_bytes());
+        for (kind, off, sz) in [
+            (0u32, sec0_off, meta.len() as u32),
+            (1u32, sec1_off, info.len() as u32),
+            (6u32, sec6_off, code.len() as u32),
+            (7u32, sec7_off, bindings.len() as u32),
+        ] {
+            fspx.extend_from_slice(&kind.to_le_bytes());
+            fspx.extend_from_slice(&off.to_le_bytes());
+            fspx.extend_from_slice(&sz.to_le_bytes());
+            fspx.extend_from_slice(&0u32.to_le_bytes());
+        }
+        fspx.resize(sec0_off as usize, 0);
+        fspx.extend_from_slice(&meta);
+        fspx.extend_from_slice(&info);
+        fspx.resize(sec6_off as usize, 0);
+        fspx.extend_from_slice(&code);
+        fspx.extend_from_slice(&bindings);
+
+        let dxbc = crate::dxbc::build(&[
+            (FourCC::SFI0, &[0; 8]),
+            (FourCC::ISG1, &[0; 8]),
+            (FourCC::OSG1, &[0; 8]),
+            (FourCC::ACCC, &fspx),
+        ]);
+        let host = translate(&dxbc).expect("Wave64 scc_some into s_cselect_b64 should translate");
+        #[cfg(windows)]
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut host.dxil.clone()).unwrap();
+        }
+    }
+
+    #[test]
+    fn translates_accc_fspx_wave64_per_lane_section_readlane63() {
+        let code_words: Vec<u32> = vec![
+            0x7E00_0281, // v_mov_b32 v0, 1
+            0xBE88_25C1, // s_or_saveexec_b64 s[8:9], -1
+            0xD501_003D, // v_cndmask_b32 v61, 0, v0, s[8:9]
+            0x0022_0080,
+            0x387A_7AFA, // v_or_b32 v61, v61, v61 quad_perm:[1,0,3,2]
+            0xFF04_B13D,
+            0x387A_7AFA, // v_or_b32 v61, v61, v61 quad_perm:[2,3,0,1]
+            0xFF04_4E3D,
+            0x387A_7AFA, // v_or_b32 v61, v61, v61 row_half_mirror
+            0xFF05_413D,
+            0x387A_7AFA, // v_or_b32 v61, v61, v61 row_mirror
+            0xFF05_403D,
+            0xD778_003E, // v_permlanex16_b32 v62, v61, 0, 0
+            0x0201_013D,
+            0x387A_7D3D, // v_or_b32 v61, v61, v62
+            0xD760_003C, // v_readlane_b32 s60, v61, 0
+            0x0001_013D,
+            0x387A_7A3C, // v_or_b32 v61, s60, v61
+            0xBEFE_0408, // s_mov_b64 exec, s[8:9]
+            0xD760_003C, // v_readlane_b32 s60, v61, 63
+            0x0001_7F3D,
+            0xBF07_803C, // s_cmp_lg_u32 s60, 0
+            0xBF85_0001, // s_cbranch_scc1 +1
+            0xBF80_0000, // s_nop 0
+            0xBF81_0000, // s_endpgm
+        ];
+
+        let code: Vec<u8> = code_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut meta = vec![0u8; 28];
+        meta[0..4].copy_from_slice(&0x4005_cf00u32.to_le_bytes());
+        meta[4..8].copy_from_slice(&0x6c09_0102u32.to_le_bytes());
+        meta[12..14].copy_from_slice(&64u16.to_le_bytes());
+        meta[14..16].copy_from_slice(&1u16.to_le_bytes());
+        meta[16..18].copy_from_slice(&1u16.to_le_bytes());
+        meta[20..24].copy_from_slice(&0x402c_0349u32.to_le_bytes());
+        meta[24..28].copy_from_slice(&0x0000_0190u32.to_le_bytes());
+        let info = [0u8; 20];
+        let mut bindings = Vec::new();
+        bindings.extend_from_slice(&0x403u32.to_le_bytes());
+        bindings.extend_from_slice(&4u32.to_le_bytes());
+        bindings.extend_from_slice(&(code_words.len() as u32).to_le_bytes());
+        bindings.extend_from_slice(&0u64.to_le_bytes());
+        bindings.extend_from_slice(&0x440u32.to_le_bytes());
+        let sec0_off = 0x50u32;
+        let sec1_off = sec0_off + meta.len() as u32;
+        let sec6_off = (sec1_off + info.len() as u32).next_multiple_of(16);
+        let sec7_off = sec6_off + code.len() as u32;
+        let total = sec7_off + bindings.len() as u32;
+        let mut fspx = Vec::new();
+        fspx.extend_from_slice(b"FSPX");
+        fspx.extend_from_slice(&1u32.to_le_bytes());
+        fspx.extend_from_slice(&4u32.to_le_bytes());
+        fspx.extend_from_slice(&total.to_le_bytes());
+        for (kind, off, sz) in [
+            (0u32, sec0_off, meta.len() as u32),
+            (1u32, sec1_off, info.len() as u32),
+            (6u32, sec6_off, code.len() as u32),
+            (7u32, sec7_off, bindings.len() as u32),
+        ] {
+            fspx.extend_from_slice(&kind.to_le_bytes());
+            fspx.extend_from_slice(&off.to_le_bytes());
+            fspx.extend_from_slice(&sz.to_le_bytes());
+            fspx.extend_from_slice(&0u32.to_le_bytes());
+        }
+        fspx.resize(sec0_off as usize, 0);
+        fspx.extend_from_slice(&meta);
+        fspx.extend_from_slice(&info);
+        fspx.resize(sec6_off as usize, 0);
+        fspx.extend_from_slice(&code);
+        fspx.extend_from_slice(&bindings);
+
+        let dxbc = crate::dxbc::build(&[
+            (FourCC::SFI0, &[0; 8]),
+            (FourCC::ISG1, &[0; 8]),
+            (FourCC::OSG1, &[0; 8]),
+            (FourCC::ACCC, &fspx),
+        ]);
+        let host = translate(&dxbc).expect("Wave64 per-lane section readlane63 should translate");
+        #[cfg(windows)]
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut host.dxil.clone()).unwrap();
         }
     }
 }

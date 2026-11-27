@@ -2066,7 +2066,10 @@ impl<'a> Tracer<'a> {
         Ok(out)
     }
 
-    /// Consecutive dwords of one scalar load.
+    /// Consecutive dwords of one scalar load, including ACO's raw-buffer
+    /// descriptor normalization on a 4-dword buffer descriptor (clearing
+    /// `stride` in word 1, scaling `num_records` in word 2, and setting
+    /// `OOB_SELECT` in word 3 while preserving the loaded base address).
     fn loaded(&self, words: &[Term]) -> Option<Source> {
         let Term::Value(v0) = words[0] else {
             return None;
@@ -2077,15 +2080,78 @@ impl<'a> Tracer<'a> {
             return None;
         }
         let first = inst.writes.iter().position(|w| w.1 == v0)?;
-        let same = words.iter().enumerate().all(|(k, w)| {
+        let exact = words.iter().enumerate().all(|(k, w)| {
             inst.writes
                 .get(first + k)
                 .is_some_and(|x| *w == Term::Value(x.1))
         });
-        same.then_some(Source::Loaded {
-            load,
-            first: first as u8,
-        })
+        if exact {
+            return Some(Source::Loaded {
+                load,
+                first: first as u8,
+            });
+        }
+        if words.len() == 4 && inst.writes.len() >= first + 4 {
+            let w1 = inst.writes[first + 1].1;
+            let w2 = inst.writes[first + 2].1;
+            let w3 = inst.writes[first + 3].1;
+            if self.is_raw_buffer_word1(words[1], w1)
+                && self.is_raw_buffer_word2(words[2], w2)
+                && self.is_raw_buffer_word3(words[3], w3)
+            {
+                return Some(Source::Loaded {
+                    load,
+                    first: first as u8,
+                });
+            }
+        }
+        None
+    }
+
+    fn sop2_with_const(&self, v: Value, name: &str, k: u32) -> Option<Term> {
+        let (_, [a, b]) = self.sop2(v, &[name])?;
+        if a == Term::Const(k) {
+            Some(b)
+        } else if b == Term::Const(k) {
+            Some(a)
+        } else {
+            None
+        }
+    }
+
+    fn is_raw_buffer_word1(&self, term: Term, loaded: Value) -> bool {
+        match term {
+            Term::Value(v) if v == loaded => true,
+            Term::Value(v) => {
+                self.sop2_with_const(v, "s_and_b32", 0xC000_FFFF) == Some(Term::Value(loaded))
+            }
+            _ => false,
+        }
+    }
+
+    fn is_raw_buffer_word2(&self, term: Term, loaded: Value) -> bool {
+        match term {
+            Term::Value(v) if v == loaded => true,
+            Term::Value(v) => self
+                .sop2(v, &["s_mul_i32"])
+                .is_some_and(|(_, [a, b])| a == Term::Value(loaded) || b == Term::Value(loaded)),
+            _ => false,
+        }
+    }
+
+    fn is_raw_buffer_word3(&self, term: Term, loaded: Value) -> bool {
+        match term {
+            Term::Value(v) if v == loaded => true,
+            Term::Value(v) => {
+                let Some(Term::Value(cleared)) = self.sop2_with_const(v, "s_or_b32", 0x3000_0000)
+                else {
+                    return false;
+                };
+                self.sop2_with_const(cleared, "s_and_b32", 0xCFFF_FFFF)
+                    == Some(Term::Value(loaded))
+            }
+            _ => false,
+        }
     }
 
     /// A descriptor the code keeps per lane: every dword of `words` is the
@@ -2331,6 +2397,18 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     if inst.name() == "s_movk_i32" {
         return Some(Moved::Const(i32::from((*imm)? as i16) as u32));
     }
+    if let [Operand::Const(a), Operand::Const(b)] = src.as_slice() {
+        let (a, b) = (inline(*a)?, inline(*b)?);
+        match inst.name() {
+            "s_lshl_b32" => return Some(Moved::Const(a.wrapping_shl(b & 31))),
+            "s_bfm_b32" => {
+                let width = a & 31;
+                let mask = 1u32.wrapping_shl(width).wrapping_sub(1);
+                return Some(Moved::Const(mask.wrapping_shl(b & 31)));
+            }
+            _ => {}
+        }
+    }
     let src = src.first()?;
     match (inst.name(), *src) {
         ("s_mov_b32" | "s_mov_b64", Operand::Scalar { code, .. }) if code != NULL => {
@@ -2343,7 +2421,12 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
         // that has no inline form; fold more if descriptors need it.
         ("s_brev_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(x.reverse_bits())),
         ("s_not_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(!x)),
-        // 64-bit inline integers are sign-extended.
+        // 64-bit inline integers and literals are sign-extended.
+        ("s_mov_b64", Operand::Literal(low)) => Some(Moved::Const(if k == 0 {
+            low
+        } else {
+            ((low as i32) >> 31) as u32
+        })),
         ("s_mov_b64", Operand::Const(c @ 128..=208)) => {
             let low = inline(c)?;
             Some(Moved::Const(if k == 0 {
@@ -3844,5 +3927,49 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    #[test]
+    fn traces_aco_normalized_loaded_buffer_descriptor_and_folded_sampler_constants() {
+        let words = [
+            0xBE88_0300u32, // s_mov_b32 s8, s0
+            0xBE89_0380,    // s_mov_b32 s9, 0
+            0xF408_0204,    // s_load_dwordx4 s[8:11], s[8:9], 0x40
+            0xFA00_0040,
+            0xBF8C_C07F,    // s_waitcnt lgkmcnt(0)
+            0x938C_FF09,    // s_bfe_u32 s12, s9, 0x000e0010
+            0x000E_0010,
+            0x848C_810C,    // s_add_u32 s12, s12, 1
+            0x870B_FF0B,    // s_and_b32 s11, s11, 0xcfffffff
+            0xCFFF_FFFF,
+            0x930A_0C0A,    // s_mul_i32 s10, s10, s12
+            0x880B_FF0B,    // s_or_b32 s11, s11, 0x30000000
+            0x3000_0000,
+            0x8709_FF09,    // s_and_b32 s9, s9, 0xc000ffff
+            0xC000_FFFF,
+            0xE030_0000, // buffer_load_dword v1, v0, s[8:11], 0 offen
+            0x8002_0100,
+            0xBE80_0300, // s_mov_b32 s0, s0
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xF40C_0000, // s_load_dwordx8 s[0:7], s[0:1], 0
+            0xFA00_0000,
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xB010_3092, // s_movk_i32 s16, 0x3092
+            0x9211_8C8C, // s_bfm_b32 s17, 12, 12
+            0xBE92_04FF, // s_mov_b64 s[18:19], 0x18500000
+            0x1850_0000,
+            0xF09C_0708, // image_sample_lz v[2:4], v[0:1], s[0:7], s[16:19] dmask:0x7 dim:2d
+            0x0080_0200,
+            0xBF81_0000, // s_endpgm
+        ];
+        let r = track_words(&words, &[param(Table, 0, 1)], HwStage::Cs);
+        assert!(matches!(
+            r.descriptors[0].source,
+            Source::Loaded { first: 0, .. }
+        ));
+        assert_eq!(
+            r.descriptors[2].source,
+            Source::Constant(vec![0x3092, 0x00FF_F000, 0x1850_0000, 0])
+        );
     }
 }

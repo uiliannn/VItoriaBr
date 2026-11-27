@@ -102,7 +102,7 @@ impl<'a> Lower<'a> {
             let Fields::Image { cache, .. } = &inst.fields else {
                 unreachable!()
             };
-            if *d16 || *a16 {
+            if *d16 {
                 return Err("a 16-bit image atomic");
             }
             // Compare-exchange consumes a replacement followed by a comparand.
@@ -190,9 +190,7 @@ impl<'a> Lower<'a> {
             if name != "image_store" {
                 return Err("an image store to a mip level");
             }
-            // shortcut: stores are taken to write all four channels of a
-            // float format (the console converts by the view's format).
-            if *dmask != 0xF {
+            if *dmask == 0 || *dmask > 0xF {
                 return Err("an image store of some channels");
             }
             let iu = self.s.m.undef(self.s.t.i32);
@@ -203,14 +201,19 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image store data");
             };
-            let mut vals = Vec::new();
+            let zero = self.s.m.f32(0);
+            let mut vals = vec![zero; 4];
+            let mut packed_idx = 0u8;
             for k in 0..4u8 {
+                if *dmask >> k & 1 == 0 {
+                    continue;
+                }
                 // d16: two f16 channels per VGPR, low half first.
-                let r = if *d16 { k / 2 } else { k };
+                let r = if *d16 { packed_idx / 2 } else { packed_idx };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
-                vals.push(if *d16 {
+                vals[k as usize] = if *d16 {
                     let mut x = self.i32_of(v)?;
-                    if k % 2 == 1 {
+                    if packed_idx % 2 == 1 {
                         let k16 = self.s.m.i32(16);
                         x = self.s.m.bin(self.cur, Bin::LShr, x, k16);
                     }
@@ -219,7 +222,8 @@ impl<'a> Lower<'a> {
                         .op(self.cur, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
                 } else {
                     self.float_of(v)?
-                });
+                };
+                packed_idx += 1;
             }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
@@ -1167,5 +1171,143 @@ mod tests {
             OFF_2D,
             Some(4)
         )));
+    }
+
+    #[test]
+    fn image_atomic_a16_allowed_and_d16_refused() {
+        let lower_atomic = |d16: bool| {
+            let mut words = vec![
+                0xBE94_0300, // s_mov_b32 s20, s0 (UAV table)
+                0xBE95_0380, // s_mov_b32 s21, 0
+                0xF40C_020A,
+                0xFA00_0000, // s_load_dwordx8 s[8:15], s[20:21], null
+                0x7E00_0280, // v_mov_b32 v0, 0
+                0x7E18_0281, // v_mov_b32 v12, 1
+                0xF044_3108, // image_atomic_add v12, v0, s[8:15] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm a16 (glc)
+                0x4002_0C00 | (u32::from(d16) << 31),
+                S_ENDPGM,
+            ];
+            let (layout, used) = (
+                vec![root(RootType::Table, 0, 0)],
+                vec![UsedResource {
+                    kind: ResourceType::Uav,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 8,
+                    user_data: 0,
+                    slot: 0,
+                }],
+            );
+            let code: Vec<u8> = words.drain(..).flat_map(|w| w.to_le_bytes()).collect();
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 16,
+                layout,
+                used,
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 0,
+                    threads: [32, 1, 1],
+                }),
+                code,
+            };
+            let p = ir::build(&native.code, native.wave64, native.vgprs)?;
+            let st = structure::structure(&p)?;
+            let io = io::raise(&p, &native)?;
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+        };
+
+        let ok = lower_atomic(false).expect("a16 image_atomic_add should lower");
+        validate_dxil_if_available(&ok.dxil).expect("DXIL validation");
+        assert!(matches!(
+            lower_atomic(true),
+            Err(crate::ShaderError::Unsupported {
+                what: "a 16-bit image atomic",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn image_store_partial_dmask_lowers() {
+        let lower_store = |dmask: u8, a16: bool, d16: bool| {
+            let words = [
+                0xBE94_0300, // s_mov_b32 s20, s0 (UAV table)
+                0xBE95_0380, // s_mov_b32 s21, 0
+                0xF40C_020A,
+                0xFA00_0000, // s_load_dwordx8 s[8:15], s[20:21], null
+                0x7E00_0280, // v_mov_b32 v0, 0
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0x7E14_0280, // v_mov_b32 v10, 0
+                0x7E16_0280, // v_mov_b32 v11, 0
+                // image_store v10, v0, s[8:15] dmask:<dmask> dim:SQ_RSRC_IMG_2D unorm [a16] [d16]
+                (0x3C << 26)
+                    | (0x08 << 18)
+                    | (1 << 12)
+                    | (u32::from(dmask) << 8)
+                    | (1 << 3),
+                (u32::from(d16) << 31) | (u32::from(a16) << 30) | (2 << 16) | (10 << 8),
+                S_ENDPGM,
+            ];
+            let (layout, used) = (
+                vec![root(RootType::Table, 0, 0)],
+                vec![UsedResource {
+                    kind: ResourceType::Uav,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 8,
+                    user_data: 0,
+                    slot: 0,
+                }],
+            );
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 16,
+                layout,
+                used,
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 0,
+                    threads: [32, 1, 1],
+                }),
+                code,
+            };
+            let p = ir::build(&native.code, native.wave64, native.vgprs)?;
+            let st = structure::structure(&p)?;
+            let io = io::raise(&p, &native)?;
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+        };
+
+        let r_d16 = lower_store(0x1, true, true).expect("dmask=1 a16 d16 image_store should lower");
+        validate_dxil_if_available(&r_d16.dxil).expect("DXIL validation");
+        let rg = lower_store(0x3, false, false).expect("dmask=3 image_store should lower");
+        validate_dxil_if_available(&rg.dxil).expect("DXIL validation");
     }
 }

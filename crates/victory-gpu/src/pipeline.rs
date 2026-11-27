@@ -205,14 +205,11 @@ impl Shader {
 
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
-    use victory_shader::{Container, FourCC, HwStage};
+    use victory_shader::{Container, HwStage};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let programs = match c.part(FourCC::DXIL) {
-        Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
-        None => Vec::new(),
-    };
+    let programs = victory_shader::container_programs(&c).map_err(|e| e.to_string())?;
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
     let compute_threads = programs.iter().find_map(|p| match &p.io {
@@ -284,7 +281,7 @@ static BUILDER: Mutex<Builder> = Mutex::new(Builder {
 /// Whether `shaders` are a pipeline of the structure builder.
 #[cfg(windows)]
 fn of_builder(shaders: &[Arc<Shader>]) -> bool {
-    use victory_shader::{Container, FourCC};
+    use victory_shader::Container;
     let [shader] = shaders else { return false };
     if shader.stage != "compute" {
         return false;
@@ -292,8 +289,8 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
     let Ok(c) = Container::parse(&shader.container) else {
         return false;
     };
-    c.part(FourCC::DXIL)
-        .and_then(|part| victory_shader::native_programs(part.data).ok())
+    victory_shader::container_programs(&c)
+        .ok()
         .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
 }
 
@@ -325,12 +322,12 @@ impl Shader {
 /// ray-tracing structure.
 #[cfg(windows)]
 fn container_walks(container: &[u8]) -> bool {
-    use victory_shader::{Container, FourCC};
+    use victory_shader::Container;
     let Ok(c) = Container::parse(container) else {
         return false;
     };
-    c.part(FourCC::DXIL)
-        .and_then(|part| victory_shader::native_programs(part.data).ok())
+    victory_shader::container_programs(&c)
+        .ok()
         .is_some_and(|programs| programs.iter().any(|p| code_walks(&p.code)))
 }
 
@@ -1087,5 +1084,101 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn translates_accc_fspx_compute_container_in_pipeline() {
+        let code_words: Vec<u32> = vec![
+            0xBE88_0304, // s_mov_b32 s8, s4
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xF408_0204, // s_load_dwordx4 s[8:11], s[8:9], 0x58*4=0x160
+            0xFA00_0160,
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xE070_1000, // buffer_store_dword v0, v1, s[8:11], 0 offen
+            0x8002_0001,
+            0xBF81_0000, // s_endpgm
+        ];
+        let code: Vec<u8> = code_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut meta = vec![0u8; 28];
+        meta[0..4].copy_from_slice(&0x4005_cf00u32.to_le_bytes());
+        meta[4..8].copy_from_slice(&0x6c09_0102u32.to_le_bytes());
+        meta[12..14].copy_from_slice(&64u16.to_le_bytes());
+        meta[14..16].copy_from_slice(&1u16.to_le_bytes());
+        meta[16..18].copy_from_slice(&1u16.to_le_bytes());
+        meta[18..20].copy_from_slice(&0x0010u16.to_le_bytes());
+        meta[20..24].copy_from_slice(&0x402c_0341u32.to_le_bytes());
+        meta[24..28].copy_from_slice(&0x0000_009cu32.to_le_bytes());
+        let info = [0u8; 20];
+        let mut bindings = Vec::new();
+        bindings.extend_from_slice(&0x403u32.to_le_bytes());
+        bindings.extend_from_slice(&(4u32 + 32).to_le_bytes());
+        bindings.extend_from_slice(&(code_words.len() as u32).to_le_bytes());
+        bindings.extend_from_slice(&0u64.to_le_bytes());
+        bindings.extend_from_slice(&((8u32 << 12) | 0x440).to_le_bytes());
+        for w in [0x41u32, 0x0303, 0x58, 8, 1, 0x0000_0404, u32::MAX, 0] {
+            bindings.extend_from_slice(&w.to_le_bytes());
+        }
+        let sec0_off = 0x50u32;
+        let sec1_off = sec0_off + meta.len() as u32;
+        let sec6_off = (sec1_off + info.len() as u32).next_multiple_of(16);
+        let sec7_off = sec6_off + code.len() as u32;
+        let total = sec7_off + bindings.len() as u32;
+        let mut fspx = Vec::new();
+        fspx.extend_from_slice(b"FSPX");
+        fspx.extend_from_slice(&1u32.to_le_bytes());
+        fspx.extend_from_slice(&4u32.to_le_bytes());
+        fspx.extend_from_slice(&total.to_le_bytes());
+        for (kind, off, sz) in [
+            (0u32, sec0_off, meta.len() as u32),
+            (1u32, sec1_off, info.len() as u32),
+            (6u32, sec6_off, code.len() as u32),
+            (7u32, sec7_off, bindings.len() as u32),
+        ] {
+            fspx.extend_from_slice(&kind.to_le_bytes());
+            fspx.extend_from_slice(&off.to_le_bytes());
+            fspx.extend_from_slice(&sz.to_le_bytes());
+            fspx.extend_from_slice(&0u32.to_le_bytes());
+        }
+        fspx.resize(sec0_off as usize, 0);
+        fspx.extend_from_slice(&meta);
+        fspx.extend_from_slice(&info);
+        fspx.resize(sec6_off as usize, 0);
+        fspx.extend_from_slice(&code);
+        fspx.extend_from_slice(&bindings);
+
+        let parts: &[(&[u8; 4], &[u8])] = &[
+            (b"SFI0", &[0; 8]),
+            (b"ISG1", &[0; 8]),
+            (b"OSG1", &[0; 8]),
+            (b"ACCC", &fspx),
+        ];
+        let table = 0x20 + 4 * parts.len();
+        let size = table + parts.iter().map(|(_, d)| 8 + d.len()).sum::<usize>();
+        let mut dxbc = Vec::with_capacity(size);
+        dxbc.extend_from_slice(b"DXBC");
+        dxbc.extend_from_slice(&[0; 16]);
+        dxbc.extend_from_slice(&1u16.to_le_bytes());
+        dxbc.extend_from_slice(&0u16.to_le_bytes());
+        dxbc.extend_from_slice(&(size as u32).to_le_bytes());
+        dxbc.extend_from_slice(&(parts.len() as u32).to_le_bytes());
+        let mut off = table;
+        for (_, d) in parts {
+            dxbc.extend_from_slice(&(off as u32).to_le_bytes());
+            off += 8 + d.len();
+        }
+        for (fcc, d) in parts {
+            dxbc.extend_from_slice(*fcc);
+            dxbc.extend_from_slice(&(d.len() as u32).to_le_bytes());
+            dxbc.extend_from_slice(d);
+        }
+
+        let t = super::translate(&dxbc).expect("pipeline translate should handle ACCC");
+        assert_eq!(t.compute_threads, Some([64, 1, 1]));
+        assert!(t.stores);
+        assert_eq!(t.used_written, [true]);
+        assert!(!t.write_unknown);
+        assert!(!container_walks(&dxbc));
     }
 }

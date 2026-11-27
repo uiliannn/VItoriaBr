@@ -139,10 +139,13 @@ pub(crate) enum Shape {
 }
 
 /// The section starting at instruction `start` of a block: its restore
-/// index and the shapes of the values it writes.
+/// index, the shapes of the values it writes where every lane agrees, and
+/// per-lane shapes for values where only some lanes (such as lane 63) hold
+/// a recognized result.
 pub(crate) struct Section {
     pub end: usize,
     pub shapes: HashMap<Value, Shape>,
+    pub lane_shapes: HashMap<Value, Vec<Option<Shape>>>,
 }
 
 /// Every whole-wave section of `block`, by start index.
@@ -180,8 +183,15 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
         let Some(end) = end else {
             break;
         };
-        let shapes = simulate(&insts[i + 1..end], wave, saved);
-        out.insert(i, Section { end, shapes });
+        let (shapes, lane_shapes) = simulate(&insts[i + 1..end], wave, saved);
+        out.insert(
+            i,
+            Section {
+                end,
+                shapes,
+                lane_shapes,
+            },
+        );
         i = end + 1;
     }
     out
@@ -268,7 +278,11 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
     }
 }
 
-fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
+fn simulate(
+    insts: &[Inst],
+    wave: u32,
+    saved: Value,
+) -> (HashMap<Value, Shape>, HashMap<Value, Vec<Option<Shape>>>) {
     let all = if wave == 64 {
         u64::MAX
     } else {
@@ -688,18 +702,20 @@ fn constant(inst: &Inst) -> Option<u64> {
     }
 }
 
-/// The shape of each value, where every lane agrees on one.
+/// The shape of each value, where every lane agrees on one, plus per-lane
+/// shapes for vector values where only some lanes hold a recognized shape.
 fn shapes(
     vec: HashMap<Value, Vec<Sym>>,
     uni: HashMap<Value, Sym>,
     wave: u32,
-) -> HashMap<Value, Shape> {
+) -> (HashMap<Value, Shape>, HashMap<Value, Vec<Option<Shape>>>) {
     let all = if wave == 64 {
         u64::MAX
     } else {
         u64::from(u32::MAX)
     };
     let mut out = HashMap::new();
+    let mut lane_out = HashMap::new();
     let single = |s: Sym| match s {
         Sym::K(k) => Some(Shape::K(k)),
         Sym::Own(x) | Sym::Uni(x) => Some(Shape::Value(x)),
@@ -727,9 +743,14 @@ fn shapes(
     for (v, lanes) in vec {
         if let Some(sh) = per_lane(&lanes, all) {
             out.insert(v, sh);
+        } else {
+            let per: Vec<Option<Shape>> = lanes.iter().copied().map(single).collect();
+            if per.iter().any(Option::is_some) {
+                lane_out.insert(v, per);
+            }
         }
     }
-    out
+    (out, lane_out)
 }
 
 fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {

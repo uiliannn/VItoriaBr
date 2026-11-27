@@ -343,6 +343,8 @@ struct Lower<'a> {
     cur_ir: usize,
     /// Whole-wave sections by block and start index.
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
+    /// Values written in a section, by `(block, start)`.
+    section_in: HashMap<Value, (usize, usize)>,
     /// Values written in a section that code outside it reads.
     section_out: HashSet<Value>,
     /// The program's constant table (the code from the first byte read
@@ -1274,8 +1276,11 @@ pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     };
     ops.into_iter().any(|op| match *op {
         Operand::Scalar { code, .. } if code != NULL => i.read(Reg::S(code)).is_some_and(is_mask),
+        Operand::Const(251) => i.read(Reg::S(crate::ir::VCC)).is_some_and(is_mask),
+        Operand::Const(252) => i.read(Reg::S(EXEC)).is_some_and(is_mask),
+        Operand::Const(253) => i.read(Reg::Scc).is_some_and(|v| st.scc_some.contains_key(&v)),
         _ => false,
-    })
+    }) || i.read(Reg::Scc).is_some_and(|v| st.scc_some.contains_key(&v))
 }
 
 /// The parameters packing 16-bit rows two per dword and where each lays
@@ -1820,6 +1825,7 @@ impl<'a> Lower<'a> {
                 .collect(),
             cur_ir: 0,
             sections: HashMap::new(),
+            section_in: HashMap::new(),
             section_out: HashSet::new(),
             code_table: None,
             counters: HashMap::new(),
@@ -2017,6 +2023,9 @@ impl<'a> Lower<'a> {
                     }
                 }
             }
+        }
+        for (w, (sb, start, _)) in inside {
+            self.section_in.insert(w, (sb, start));
         }
     }
 
@@ -3500,6 +3509,12 @@ impl<'a> Lower<'a> {
             }
             // Read only by the wait that a zero entry word skips ([`enters_pops`]).
             Operand::Const(POPS_EXITING_WAVE_ID) if self.pops => Ok(self.s.m.i32(0)),
+            Operand::Const(251) => self.mask_zero(crate::ir::VCC, inst),
+            Operand::Const(252) => self.mask_zero(EXEC, inst),
+            Operand::Const(253) => {
+                let b = self.scc_in(inst)?;
+                Ok(self.s.m.cast(self.cur, Cast::ZExt, b, self.s.t.i32))
+            }
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
@@ -4103,16 +4118,22 @@ impl<'a> Lower<'a> {
     /// exchange theirs, which needs every lane there.
     fn scc_some(&mut self, scc: Value) -> Result<V, Why> {
         let &m = self.x.st.scc_some.get(&scc).ok_or(LANE_MASK)?;
-        // (not for a console wave cut into host waves that do not exchange)
-        if !self.console_lanes || self.local || self.exchange.is_none() && self.halves.is_some() {
-            return Err(LANE_MASK);
-        }
         let made = self.def_block.get(&scc).copied();
         let at = match made {
             None => self.s.entry,
             Some(b) if b == self.cur_ir => self.cur,
             Some(b) => self.tail[b].ok_or("a lane mask written after its use")?,
         };
+        self.any_lane(m, at, made)
+    }
+
+    /// Whether any lane in `m` has its bit set, computed at `at` (with
+    /// half-wave exchange when a Wave64 console program runs on Wave32).
+    fn any_lane(&mut self, m: Bool, at: usize, made: Option<usize>) -> Result<V, Why> {
+        // (not for a console wave cut into host waves that do not exchange)
+        if !self.console_lanes || self.local || self.exchange.is_none() && self.halves.is_some() {
+            return Err(LANE_MASK);
+        }
         let bit = self.boolean(m, at)?;
         let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
         let some = self.s.op(at, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[bit]);
@@ -4129,6 +4150,29 @@ impl<'a> Lower<'a> {
         let both = self.s.m.bin(at, Bin::Or, lo, hi);
         let z = self.s.m.i32(0);
         Ok(self.s.m.cmp(at, pred::NE, both, z))
+    }
+
+    /// Reads `vccz` or `execz` as a 32-bit `0` or `1` (`1` when all bits are 0).
+    fn mask_zero(&mut self, reg: u8, inst: &Inst) -> Result<V, Why> {
+        let lo = inst.read(Reg::S(reg)).ok_or("an unread operand")?;
+        let c = self.cur;
+        if let Some(&m) = self.x.st.masks.get(&lo) {
+            let some = self.any_lane(m, c, Some(self.cur_ir))?;
+            let t = self.s.m.bool(true);
+            let zero = self.s.m.bin(c, Bin::Xor, some, t);
+            return Ok(self.s.m.cast(c, Cast::ZExt, zero, self.s.t.i32));
+        }
+        let lo_v = self.i32_of(lo)?;
+        let word = if self.x.p.wave64 {
+            let hi = inst.read(Reg::S(reg + 1)).ok_or("an unread operand")?;
+            let hi_v = self.i32_of(hi)?;
+            self.s.m.bin(c, Bin::Or, lo_v, hi_v)
+        } else {
+            lo_v
+        };
+        let z = self.s.m.i32(0);
+        let zero = self.s.m.cmp(c, pred::EQ, word, z);
+        Ok(self.s.m.cast(c, Cast::ZExt, zero, self.s.t.i32))
     }
 
     fn wave_wide(&mut self, b: usize, when: Bool) -> Result<V, Why> {
@@ -5414,6 +5458,7 @@ impl<'a> Lower<'a> {
                     l.i32_of(v)
                 }
                 Some(op) if h == 0 => l.operand(inst, op),
+                Some(Operand::Const(251..=253)) => Ok(l.s.m.i32(0)),
                 Some(Operand::Const(k)) => {
                     let x = crate::resource::inline(*k).ok_or("a special operand")?;
                     Ok(l.s.m.i32(if (x as i32) < 0 { u32::MAX } else { 0 }))
@@ -5853,6 +5898,9 @@ impl<'a> Lower<'a> {
 
     fn scc_in(&mut self, inst: &Inst) -> Result<V, Why> {
         let v = inst.read(Reg::Scc).ok_or("an unread SCC")?;
+        if self.x.st.scc_some.contains_key(&v) {
+            return self.scc_some(v);
+        }
         match self.get(v)? {
             Val::Bit(x) => Ok(x),
             _ => Err("SCC without a value"),
@@ -7983,6 +8031,24 @@ impl<'a> Lower<'a> {
                 Ok(())
             }
             "v_readlane_b32" => {
+                if let (Some(&Operand::Vector { reg, .. }), Some(op_lane)) =
+                    (v.src.first(), v.src.get(1))
+                    && let Some(val) = inst.read(Reg::V(reg))
+                    && let Some(&(sb, start)) = self.section_in.get(&val)
+                    && let Some(l) = match *op_lane {
+                        Operand::Const(c) => crate::resource::inline(c),
+                        Operand::Literal(x) => Some(x),
+                        _ => None,
+                    }
+                    && let Some(sh) = self.sections[&sb][&start]
+                        .lane_shapes
+                        .get(&val)
+                        .and_then(|ls| ls.get(l as usize).copied().flatten())
+                {
+                    let own = self.own_bits.totals.contains(&val);
+                    let r = self.shape(sh, own)?;
+                    return int(self, r);
+                }
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
@@ -8872,9 +8938,23 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        let op = *v.src.get(k).ok_or("a missing operand")?;
-        let sel = if high { v.opsel_hi } else { v.opsel } >> k & 1 != 0;
-        let x = if float {
+        let (op, sel) = if inst.name() == "v_pk_fmac_f16" {
+            let op = if k == 2 {
+                v.dst.ok_or("an accumulator")?
+            } else {
+                *v.src.get(k).ok_or("a missing operand")?
+            };
+            (op, high)
+        } else {
+            let op = *v.src.get(k).ok_or("a missing operand")?;
+            (op, if high { v.opsel_hi } else { v.opsel } >> k & 1 != 0)
+        };
+        let x = if k == 2 && inst.name() == "v_pk_fmac_f16" {
+            let Operand::Vector { reg, .. } = op else {
+                return Err("an accumulator");
+            };
+            self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?
+        } else if float {
             self.f16_operand(inst, &op)?
         } else {
             self.operand(inst, &op)?
@@ -8898,7 +8978,7 @@ impl<'a> Lower<'a> {
         };
         let float = op.ends_with("_f16");
         let n = match op {
-            "fma_f16" | "mad_u16" | "mad_i16" => 3,
+            "fma_f16" | "fmac_f16" | "mad_u16" | "mad_i16" => 3,
             "add_f16" | "mul_f16" | "min_f16" | "max_f16" | "add_u16" | "sub_u16" | "add_i16"
             | "sub_i16" | "mul_lo_u16" | "lshlrev_b16" | "lshrrev_b16" | "ashrrev_i16"
             | "max_u16" | "min_u16" | "max_i16" | "min_i16" => 2,
@@ -11805,5 +11885,22 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn special_operands_scc_vccz_execz_lower() {
+        let words = [
+            0x7D84_0080, // v_cmp_eq_i32 vcc, 0, v0
+            0xBF04_8500, // s_cmp_lt_i32 s0, 5
+            0xBE8A_03FD, // s_mov_b32 s10, scc
+            0x930A_FD0A, // s_mul_i32 s10, s10, scc
+            0x870A_FB0A, // s_and_b32 s10, s10, vccz
+            0x880A_FC0A, // s_or_b32 s10, s10, execz
+            0xBF07_800A, // s_cmp_lg_u32 s10, 0
+            0xBF85_0001, // s_cbranch_scc1 +1
+            0xBF80_0000, // s_nop 0
+            S_ENDPGM,
+        ];
+        lowers(&words, 1 << 7).expect("scc, vccz, and execz operands should lower");
     }
 }
