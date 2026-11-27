@@ -360,6 +360,17 @@ Diagnostics build:
 cargo build --profile diag -p victory --features diagnostics
 ```
 
+### Controls (keyboard when no XInput pad is connected)
+
+| Keys | Pad |
+| --- | --- |
+| `W A S D` / `I J K L` | left / right stick |
+| arrows | D-pad |
+| `Enter`, `Backspace`, `X`, `Y` | A, B, X, Y |
+| `Q` / `E`, `Z` / `C` | LB/RB, LT/RT |
+| `F` / `H` | L3 / R3 |
+| `Esc`, `Tab` | Menu, View |
+
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
