@@ -736,6 +736,49 @@ fn v_cvt_norm_i16_and_u16_f16_round_the_exact_product() {
 }
 
 #[test]
+fn sixteen_bit_multiply_adds_match_rdna2() {
+    // (opcode, name, [inputs] -> (result, clamped result or None if clamp
+    // is not tried)). The sources' high halves are junk the 16-bit
+    // operands must not read; the 16-bit results keep v0's high half (0).
+    type Case = ([u32; 3], u32, Option<u32>);
+    let cases: [(u16, &str, [Case; 2]); 4] = [
+        (0x373, "v_mad_u32_u16", [
+            ([0xABCD_FFFF, 0x1234_FFFF, 2], 0xFFFE_0003, None),
+            ([0xABCD_0003, 0x1234_0004, 0xFFFF_FFFF], 11, None),
+        ]),
+        (0x375, "v_mad_i32_i16", [
+            ([0xABCD_FFFF, 0x1234_8000, 5], 0x8005, None),
+            ([0xABCD_7FFF, 0x1234_7FFF, 0x8000_0000], 0xBFFF_0001, None),
+        ]),
+        (0x340, "v_mad_u16", [
+            ([0xABCD_0100, 0x1234_0100, 0x5555_0005], 0x0005, Some(0xFFFF)),
+            ([0xABCD_0003, 0x1234_0004, 0x5555_0005], 0x0011, Some(0x0011)),
+        ]),
+        (0x35E, "v_mad_i16", [
+            ([0xABCD_4000, 0x1234_0002, 0x5555_0000], 0x8000, Some(0x7FFF)),
+            ([0xABCD_8000, 0x1234_0001, 0x5555_FFFF], 0x7FFF, Some(0x8000)),
+        ]),
+    ];
+    for (op, name, cases) in cases {
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| [c.0[0], c.0[1], c.0[2], 0]).collect();
+        for clamp in [false, true] {
+            if clamp && cases[0].2.is_none() {
+                continue;
+            }
+            let [w0, w1] = vop3_mod(op, 0, vgpr(1), vgpr(2), vgpr(3), 0, 0, 0, clamp);
+            let shader = build_valu_cs(&[w0, w1]);
+            run_cases(&shader, &inputs, |backend, i, _, got| {
+                let want = if clamp { cases[i].2.unwrap() } else { cases[i].1 };
+                assert_eq!(
+                    got, want,
+                    "{backend}: {name} (clamp {clamp}) case {i} got {got:#010x}, want {want:#010x}"
+                );
+            });
+        }
+    }
+}
+
+#[test]
 fn v_sin_and_v_cos_f32_reduce_large_turns() {
     let sin_shader = build_valu_cs(&[vop1(0x035, 0, vgpr(1))]);
     let cos_shader = build_valu_cs(&[vop1(0x036, 0, vgpr(1))]);

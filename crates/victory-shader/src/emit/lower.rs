@@ -8554,6 +8554,8 @@ impl<'a> Lower<'a> {
             "v_ashrrev_i16",
             "v_max_u16",
             "v_max_i16",
+            "v_mad_u16",
+            "v_mad_i16",
             "v_min_u16",
             "v_min_i16",
             "v_cvt_u16_f16",
@@ -8732,6 +8734,41 @@ impl<'a> Lower<'a> {
             let nan = self.s.m.cmp(c, pred::UNO, a, a);
             let z = self.s.m.i32(0);
             let r = self.s.m.select(c, nan, z, r);
+            return self.write_half(inst, r, guard);
+        }
+        if matches!(name, "v_mad_u16" | "v_mad_i16") {
+            // RDNA2 ISA: D.u16 = S0.u16 * S1.u16 + S2.u16 (D.i16 from
+            // sign-extended halves), saturating to the 16-bit range with
+            // clamp. The exact sum fits in 32 bits either way: at most
+            // 0xFFFE_0001 + 0xFFFF unsigned, within +-2^30 + 2^15 signed.
+            if v.omod != 0 || v.abs != 0 || v.neg != 0 {
+                return Err("modifiers on a 16-bit integer operation");
+            }
+            let signed = name == "v_mad_i16";
+            let k16 = self.s.m.i32(16);
+            let (a, b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
+            let mut x = [a, b, self.half_src(inst, 2)?];
+            if signed {
+                for x in &mut x {
+                    let t = self.s.m.bin(c, Bin::Shl, *x, k16);
+                    *x = self.s.m.bin(c, Bin::AShr, t, k16);
+                }
+            }
+            let p = self.s.m.bin(c, Bin::Mul, x[0], x[1]);
+            let mut r = self.s.m.bin(c, Bin::Add, p, x[2]);
+            if v.clamp {
+                let clip = |l: &mut Self, r: V, p, limit: u32| {
+                    let k = l.s.m.i32(limit);
+                    let out = l.s.m.cmp(c, p, r, k);
+                    l.s.m.select(c, out, k, r)
+                };
+                r = if signed {
+                    let r = clip(self, r, pred::SLT, 0xFFFF_8000);
+                    clip(self, r, pred::SGT, 0x7FFF)
+                } else {
+                    clip(self, r, pred::IUGT, 0xFFFF)
+                };
+            }
             return self.write_half(inst, r, guard);
         }
         if matches!(name, "v_cvt_norm_i16_f16" | "v_cvt_norm_u16_f16") {
@@ -9153,6 +9190,22 @@ impl<'a> Lower<'a> {
                     .s
                     .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, 31, &[a]);
                 self.s.m.bin(c, Bin::Add, n, b)
+            }
+            "v_mad_u32_u16" | "v_mad_i32_i16" => {
+                // RDNA2 ISA: D.u32 = S0.u16 * S1.u16 + S2.u32 (D.i32 from
+                // sign-extended halves); op_sel picks the halves of src0
+                // and src1. The 32-bit sum wraps.
+                let (mut a, mut b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
+                let d = s(self, 2)?;
+                if name == "v_mad_i32_i16" {
+                    let k16 = k(self, 16);
+                    let t = self.s.m.bin(c, Bin::Shl, a, k16);
+                    a = self.s.m.bin(c, Bin::AShr, t, k16);
+                    let t = self.s.m.bin(c, Bin::Shl, b, k16);
+                    b = self.s.m.bin(c, Bin::AShr, t, k16);
+                }
+                let m = self.s.m.bin(c, Bin::Mul, a, b);
+                self.s.m.bin(c, Bin::Add, m, d)
             }
             "v_mad_u32_u24" | "v_mad_i32_i24" => {
                 let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
@@ -11047,6 +11100,54 @@ mod tests {
             assert_eq!(super::barrier_mode(1, 64, 64, Some(64), true, writes), fence);
             assert_eq!(super::barrier_mode(1, 32, 64, Some(64), false, writes), fence | 1);
             assert_eq!(super::barrier_mode(2, 32, 64, Some(64), true, writes), fence | 1);
+        }
+    }
+
+    /// The 16-bit multiply-adds `v_mad_u32_u16`, `v_mad_i32_i16`,
+    /// `v_mad_u16` and `v_mad_i16` decode and translate in a program that
+    /// stores the result (the last two clamped too).
+    #[test]
+    fn sixteen_bit_multiply_adds_translate() {
+        let program = |op: u32, clamp: u32| {
+            let mut words = vec![
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0xFA00_0000,
+            ];
+            // v_mov_b32 v1..v4, s0..s3
+            words.extend((0..4u32).map(|i| 0x7E00_0200 | (i + 1) << 17 | i));
+            // op v0, v1, v2, v3
+            let sources = 0x101 | 0x102 << 9 | 0x103 << 18;
+            words.extend([0xD400_0000 | op << 16 | clamp << 15, sources]);
+            words.extend([0xE070_0000, 0x8002_0000, S_ENDPGM]); // buffer_store_dword v0
+            words
+        };
+        let buffer = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let constants = RootParam { sgprs: 4, ..root(RootType::Constants, 0, 0) };
+        for (op, name, clamps) in [
+            (0x373, "v_mad_u32_u16", &[0][..]),
+            (0x375, "v_mad_i32_i16", &[0]),
+            (0x340, "v_mad_u16", &[0, 1]),
+            (0x35E, "v_mad_i16", &[0, 1]),
+        ] {
+            let code: Vec<u8> = program(op, 0).iter().flat_map(|w| w.to_le_bytes()).collect();
+            let insts = crate::gfx10::decode(&code).unwrap();
+            let names: Vec<_> = insts.iter().map(|i| i.name()).collect();
+            assert!(names.contains(&Some(name)), "{names:?}");
+            for &clamp in clamps {
+                let layout = vec![constants, root(RootType::Table, 4, 1)];
+                lower_with(&program(op, clamp), layout, vec![buffer])
+                    .unwrap_or_else(|e| panic!("{name} clamp {clamp}: {e}"));
+            }
         }
     }
 
