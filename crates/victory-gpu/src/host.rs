@@ -719,7 +719,13 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
-        tracing::info!("host D3D12 device ready");
+        let gfx = crate::graphics_config();
+        tracing::info!(
+            quality = gfx.quality.map_or("default", crate::Quality::as_str),
+            texture_budget_mb = ?gfx.texture_budget_mb,
+            ambient = ?gfx.ambient,
+            "host D3D12 device ready"
+        );
         Ok(Host {
             device,
             queue,

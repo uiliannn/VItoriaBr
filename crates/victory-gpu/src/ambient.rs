@@ -33,25 +33,10 @@ pub(crate) const PROGRAM: &[u8] = b"CS_ScreenProbes_TemporalResolve";
 /// integers): root parameter and place in its table.
 pub(crate) const LIGHT: (u8, u32) = (1, 176);
 
-/// 0.6 looked balanced; `VICTORY_AMBIENT=off` leaves what the title's resolve
-/// wrote; 0 is no indirect diffuse light at all.
-const DEFAULT: f32 = 0.6;
-
 /// The floor; `None` if off.
 pub(crate) fn level() -> Option<f32> {
-    static LEVEL: OnceLock<f32> = OnceLock::new();
-    let level = *LEVEL.get_or_init(|| {
-        let set = std::env::var("VICTORY_AMBIENT").unwrap_or_default();
-        if set.trim() == "off" {
-            return -1.0;
-        }
-        set.trim()
-            .parse()
-            .ok()
-            .filter(|l: &f32| l.is_finite() && *l >= 0.0)
-            .unwrap_or(DEFAULT)
-    });
-    (level >= 0.0).then_some(level)
+    static LEVEL: OnceLock<Option<f32>> = OnceLock::new();
+    *LEVEL.get_or_init(|| crate::graphics_config().ambient)
 }
 
 /// The light's colour: warm white, or what `VICTORY_AMBIENT_TINT=r,g,b`

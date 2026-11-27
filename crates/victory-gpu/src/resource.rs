@@ -1426,9 +1426,10 @@ pub(crate) fn host_made<'a>(
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
 /// up to `FLOOR` bytes of them, beyond that while the card's memory in use
 /// by this process is under nine tenths of the budget the system gives it
-/// ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB` sets a
-/// limit on those copies' bytes instead). Past the budget the system moves
-/// the card's memory into the PC's, which ended runs 20 and 24.
+/// ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB` or
+/// `VICTORY_QUALITY` sets a limit on those copies' bytes instead). Past the
+/// budget the system moves the card's memory into the PC's, which ended
+/// runs 20 and 24.
 #[cfg(windows)]
 pub(crate) fn room() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1436,8 +1437,7 @@ pub(crate) fn room() -> bool {
     const WITHOUT_BUDGET: u64 = 4 << 30;
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
-        let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
-        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
+        crate::texture_budget_mb().map(|mb| mb.saturating_mul(1 << 20))
     });
     // (With the tiles of the copies made level by level, whose own bytes
     // count as none: `crate::tiles`.)

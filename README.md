@@ -167,6 +167,13 @@ $env:VICTORY_DISPLAY_MODE = "1920x1080"
 
 - **Dicas para 16 GB de RAM + HDD:** Feche navegadores e aplicativos pesados antes de iniciar para liberar RAM ao cache de leitura do Windows, e configure um arquivo de paginação (*Pagefile*) manual de **16 GB a 24 GB** no SSD para evitar erro `1455` durante o carregamento.
 
+#### Presets de qualidade (`VICTORY_QUALITY`)
+- **`VICTORY_QUALITY` (`low | medium | high | ultra`):** atalho de motor que define padrões para orçamento de texturas (`VICTORY_TEXTURE_BUDGET_MB`) e iluminação ambiente (`VICTORY_AMBIENT`) **sem sobrescrever nenhuma variável `VICTORY_*` definida explicitamente** (`VICTORY_BVH_HOLD` permanece desativado por padrão em todos os presets, salvo se `VICTORY_BVH_HOLD=1` for definido manualmente; use `VICTORY_DISPLAY_MODE=1920x1080` para controlar a resolução de exibição):
+  - `low`: `VICTORY_TEXTURE_BUDGET_MB=4096` + `VICTORY_AMBIENT=0.6`
+  - `medium`: `VICTORY_TEXTURE_BUDGET_MB=5120` + `VICTORY_AMBIENT=0.6`
+  - `high`: `VICTORY_TEXTURE_BUDGET_MB=6144` + `VICTORY_AMBIENT=0.6`
+  - `ultra`: orçamento de texturas automático (90% da VRAM) + `VICTORY_AMBIENT=0.6`
+
 #### Achados importantes de tuning & diagnóstico
 - **Pele ou chão pretos (VRAM cheia / streaming):** dois fatores resolvidos:
   1. **`VICTORY_CARD_BUFFERS_MB=2048` + `VICTORY_TEXTURE_BUDGET_MB=10240`** (em 8 GB: `1024` e `5120`) evita o limite de 90% da VRAM (`no room for new ones`), que impedia novas texturas de pele/terreno de subir.
@@ -344,6 +351,13 @@ $env:VICTORY_DISPLAY_MODE = "1920x1080"
 ```
 
 - **16 GB RAM + HDD tips:** Close browsers and heavy background apps before launching to leave RAM for Windows file caching, and set a manual **16 GB–24 GB** SSD pagefile to prevent Windows error `1455` during loading.
+
+#### Quality Presets (`VICTORY_QUALITY`)
+- **`VICTORY_QUALITY` (`low | medium | high | ultra`):** engine-level shorthand that sets defaults for texture budget MB (`VICTORY_TEXTURE_BUDGET_MB`) and ambient lighting (`VICTORY_AMBIENT`) **without overriding any explicitly set `VICTORY_*` environment variable** (`VICTORY_BVH_HOLD` remains off by default across all presets unless explicitly set via `VICTORY_BVH_HOLD=1`; use `VICTORY_DISPLAY_MODE=1920x1080` to configure the display resolution):
+  - `low`: `VICTORY_TEXTURE_BUDGET_MB=4096` + `VICTORY_AMBIENT=0.6`
+  - `medium`: `VICTORY_TEXTURE_BUDGET_MB=5120` + `VICTORY_AMBIENT=0.6`
+  - `high`: `VICTORY_TEXTURE_BUDGET_MB=6144` + `VICTORY_AMBIENT=0.6`
+  - `ultra`: automatic VRAM texture budget (90% of VRAM) + `VICTORY_AMBIENT=0.6`
 
 > **Tuning notes (RTX 5060 Ti & 8 GB GPUs):** Enabling `VICTORY_TABLE_BUFFERS=1`, `VICTORY_INDIRECT_GATHER=1`, and `VICTORY_SYNC_NULL_SKIP` (default on) doubled open-world FPS on RTX 5060 Ti (`2.7 → 5.8 fps` at `3840x2160`, cutting `preparing` from `~230 ms` to `~105–113 ms`). `VICTORY_TEXTURE_BACK=1` restores shader-written water wave textures. The 2-line performance HUD (`VITORIABR | FPS | MS | DRAWS` + `RES | VRAM | GPU`) is controlled via `VICTORY_FPS_COUNTER` (`1`/`full` default, `compact`, or `0`). Use `VICTORY_CARD_BUFFERS_MB=2048` + `VICTORY_TEXTURE_BUDGET_MB=10240` on 16 GB GPUs (`1024` / `5120` on 8 GB GPUs) together with `VICTORY_PAGE_WRITES=slots` to prevent `the card has no room for new ones` and re-upload late-written placed textures (fixing black skin and ground). Keep `VICTORY_CARD_FETCH_INFLIGHT` off (`0`, default). To check session uptime, RAM and accumulated CPU:
 >
