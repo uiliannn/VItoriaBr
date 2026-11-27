@@ -3418,6 +3418,14 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn a_null_view_has_no_alias_source() {
+        // A shader resource view of no resource has no aliasing source:
+        // alias_of must return None for a null pointer and not dereference it.
+        assert_eq!(alias_of(std::ptr::null()), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn cached_placed_uav_is_visible_after_releasing_a_temporary_target() {
         static TITLE_BYTES: [u8; 4096] = [0; 4096];
         let address = TITLE_BYTES.as_ptr() as u64;
