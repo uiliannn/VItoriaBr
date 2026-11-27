@@ -306,6 +306,15 @@ impl GraphicsState {
         }
     }
 
+    /// Whether these are a pass over the screen's draws: no vertex input, no
+    /// depth or stencil. Such passes fill tables once; their shaders are few.
+    pub(crate) fn screen_pass(&self) -> bool {
+        self.inputs.is_empty()
+            && (self.depth_format == DXGI_FORMAT_UNKNOWN
+                || !self.depth.DepthEnable.as_bool() && !self.depth.StencilEnable.as_bool())
+            && self.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
+    }
+
     /// The vertex buffer slots the input layout reads.
     fn slots(&self) -> u32 {
         self.inputs
@@ -1771,5 +1780,33 @@ mod tests {
         let mut t = blend_targets(&[DXGI_FORMAT_R8G8B8A8_UNORM]);
         t.RTFormats[1] = DXGI_FORMAT_R8_UINT;
         assert_eq!(host_blend(&blending(false), &t), blending(false));
+    }
+
+    #[test]
+    fn screen_pass_classifies_inputless_depthless_triangles() {
+        let mut s = GraphicsState {
+            topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            ..Default::default()
+        };
+        // No depth format bound => effective depth/stencil off.
+        assert!(s.screen_pass());
+
+        s.depth_format = DXGI_FORMAT_D32_FLOAT;
+        assert!(!s.screen_pass(), "depth enabled with format is not a screen pass");
+
+        s.depth.DepthEnable = false.into();
+        s.depth.StencilEnable = false.into();
+        assert!(s.screen_pass());
+
+        s.depth.StencilEnable = true.into();
+        assert!(!s.screen_pass(), "stencil enabled with format is not a screen pass");
+
+        s.depth.StencilEnable = false.into();
+        s.inputs.push(D3D12_INPUT_ELEMENT_DESC::default());
+        assert!(!s.screen_pass(), "vertex input is not a screen pass");
+
+        s.inputs.clear();
+        s.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+        assert!(!s.screen_pass(), "non-triangle topology is not a screen pass");
     }
 }
