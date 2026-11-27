@@ -15,6 +15,8 @@
 //! ```
 
 mod fields;
+#[cfg(test)]
+mod llvm_tests;
 mod opcodes;
 mod sp3;
 
