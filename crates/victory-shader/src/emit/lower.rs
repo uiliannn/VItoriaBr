@@ -7851,6 +7851,19 @@ impl<'a> Lower<'a> {
                 self.write(inst, Reg::V(reg), x, guard);
                 Ok(())
             }
+            "v_cvt_pknorm_i16_f16" | "v_cvt_pknorm_u16_f16" => {
+                // RDNA2 ISA: D = {(snorm|unorm)S1.f16, (snorm|unorm)S0.f16},
+                // each the conversion v_cvt_norm_i16_f16/v_cvt_norm_u16_f16
+                // make (clamped, scaled, rounded to nearest even from the
+                // exact product; NaN gives 0). op_sel picks each f16's half.
+                let signed = name == "v_cvt_pknorm_i16_f16";
+                let lo = self.cvt_norm16_of(inst, 0, signed)?;
+                let hi = self.cvt_norm16_of(inst, 1, signed)?;
+                let k16 = self.s.m.i32(16);
+                let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
+                let r = self.s.m.bin(c, Bin::Or, lo, hi);
+                int(self, r)
+            }
             "v_cvt_pkrtz_f16_f32" => {
                 let (a, bb) = (f(self, 0)?, f(self, 1)?);
                 let lo = self.f16_toward_zero(a);
@@ -8799,17 +8812,22 @@ impl<'a> Lower<'a> {
     /// (up to 26 significant bits) would round before the rounding to an
     /// integer.
     fn cvt_norm16(&mut self, inst: &Inst, signed: bool) -> Result<V, Why> {
+        self.cvt_norm16_of(inst, 0, signed)
+    }
+
+    /// [`Self::cvt_norm16`] of source `src` (its op_sel half, abs and neg).
+    fn cvt_norm16_of(&mut self, inst: &Inst, src: usize, signed: bool) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
         let c = self.cur;
         let k = |l: &mut Self, x: u32| l.s.m.i32(x);
-        let mut h = self.half_src(inst, 0)?;
-        if v.abs & 1 != 0 {
+        let mut h = self.half_src(inst, src)?;
+        if v.abs >> src & 1 != 0 {
             let m = k(self, 0x7FFF);
             h = self.s.m.bin(c, Bin::And, h, m);
         }
-        if v.neg & 1 != 0 {
+        if v.neg >> src & 1 != 0 {
             let m = k(self, 0x8000);
             h = self.s.m.bin(c, Bin::Xor, h, m);
         }
@@ -11652,6 +11670,45 @@ mod tests {
             // One image handle, from the join's per-lane heap index.
             assert_eq!(l.nonuniform_handles, 1);
             assert!(!l.wave_ops);
+        }
+    }
+
+    /// `v_cvt_pknorm_i16_f16` and `v_cvt_pknorm_u16_f16` decode and
+    /// translate in a program that stores the result.
+    #[test]
+    fn f16_norm_packs_translate() {
+        let program = |op: u32| {
+            let mut words = vec![
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0xFA00_0000,
+            ];
+            // v_mov_b32 v1..v4, s0..s3
+            words.extend((0..4u32).map(|i| 0x7E00_0200 | (i + 1) << 17 | i));
+            // op v0, v1, v2
+            words.extend([0xD400_0000 | op << 16, 0x101 | 0x102 << 9]);
+            words.extend([0xE070_0000, 0x8002_0000, S_ENDPGM]); // buffer_store_dword v0
+            words
+        };
+        let buffer = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let constants = RootParam { sgprs: 4, ..root(RootType::Constants, 0, 0) };
+        for (op, name) in [(0x312, "v_cvt_pknorm_i16_f16"), (0x313, "v_cvt_pknorm_u16_f16")] {
+            let code: Vec<u8> = program(op).iter().flat_map(|w| w.to_le_bytes()).collect();
+            let insts = crate::gfx10::decode(&code).unwrap();
+            let names: Vec<_> = insts.iter().map(|i| i.name()).collect();
+            assert!(names.contains(&Some(name)), "{names:?}");
+            let layout = vec![constants, root(RootType::Table, 4, 1)];
+            lower_with(&program(op), layout, vec![buffer])
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
         }
     }
 

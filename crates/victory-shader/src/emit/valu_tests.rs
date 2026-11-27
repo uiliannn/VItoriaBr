@@ -876,6 +876,36 @@ fn v_cvt_u16_and_i16_f16_saturate() {
 }
 
 #[test]
+fn v_cvt_pknorm_i16_and_u16_f16_pack_two_norm_conversions() {
+    // Each half is v_cvt_norm_*16_f16's conversion of the low half of
+    // src0 (low result) and src1 (high result); the sources' high halves
+    // are junk that must not count.
+    let bits: Vec<u16> = (0..=u16::MAX)
+        .step_by(509)
+        .chain([0x3C00, 0xBC00, 0x3800, 0x3801, 0x7C00, 0xFC00, 0x7E00, 0x0001])
+        .collect();
+    for (op, signed, what) in [
+        (0x312u16, true, "v_cvt_pknorm_i16_f16"),
+        (0x313, false, "v_cvt_pknorm_u16_f16"),
+    ] {
+        let [w0, w1] = vop3(op, 0, vgpr(1), vgpr(2), 0);
+        let shader = build_valu_cs(&[w0, w1]);
+        let pairs: Vec<(u16, u16)> =
+            bits.iter().enumerate().map(|(i, &b)| (b, bits[(i * 7 + 3) % bits.len()])).collect();
+        let inputs: Vec<[u32; 4]> = pairs
+            .iter()
+            .map(|&(a, b)| [0xABCD_0000 | u32::from(a), 0x1234_0000 | u32::from(b), 0, 0])
+            .collect();
+        run_cases(&shader, &inputs, |backend, i, _, got| {
+            let (a, b) = pairs[i];
+            let want = u32::from(cvt_norm16_reference(a, signed))
+                | u32::from(cvt_norm16_reference(b, signed)) << 16;
+            assert_eq!(got, want, "{backend}: {what}({a:#06x}, {b:#06x}) = {got:#010x}, want {want:#010x}");
+        });
+    }
+}
+
+#[test]
 fn v_sin_and_v_cos_f16_reduce_large_turns() {
     let sin_shader = build_valu_cs(&[vop1(0x060, 0, vgpr(1))]);
     let cos_shader = build_valu_cs(&[vop1(0x061, 0, vgpr(1))]);
