@@ -8531,7 +8531,7 @@ impl Host {
         &self,
         texture: &ID3D12Resource,
         state: u32,
-        over: Option<(&ID3D12Resource, u32)>,
+        over: Option<(&ID3D12Resource, u32, Option<bool>)>,
         frame: u64,
     ) -> Option<bool> {
         let showing = std::time::Instant::now();
@@ -8544,16 +8544,23 @@ impl Host {
         &self,
         texture: &ID3D12Resource,
         state: u32,
-        over: Option<(&ID3D12Resource, u32)>,
+        over: Option<(&ID3D12Resource, u32, Option<bool>)>,
         frame: u64,
     ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
-        let Some(format) = swap_format(desc.Format) else {
+        let Some(base_format) = swap_format(desc.Format) else {
             tracing::warn!(format = desc.Format.0, "cannot present this format");
             return None;
         };
-        let (width, height) = (desc.Width as u32, desc.Height);
+        let (base_width, base_height) = (desc.Width as u32, desc.Height);
+        let (width, height, format) = over
+            .and_then(|(ui, _, _)| {
+                // SAFETY: `ui` is a live resource.
+                let ui_desc = unsafe { ui.GetDesc() };
+                crate::compose::target(&self.device, &desc, &ui_desc)
+            })
+            .unwrap_or((base_width, base_height, base_format));
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
             *presenter = match self.presenter(width, height, format) {
@@ -8622,21 +8629,25 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
-            let laid = over.and_then(|(ui, ui_state)| {
-                crate::compose::record(&self.device, list, texture, ui, ui_state)
+            let mut pre_barriers = Vec::with_capacity(2);
+            if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+                pre_barriers.push(transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE));
+            }
+            pre_barriers.push(transition(
+                &back,
+                D3D12_RESOURCE_STATE_PRESENT,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            ));
+            list.ResourceBarrier(&pre_barriers);
+            let laid = over.and_then(|(ui, ui_state, premultiplied)| {
+                crate::compose::record(&self.device, list, texture, ui, ui_state, premultiplied)
             });
             if let Some(laid) = &laid {
                 copy.keep(laid);
+                list.CopyResource(&back, laid);
+            } else if (width, height, format) == (base_width, base_height, base_format) {
+                list.CopyResource(&back, texture);
             }
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
-            list.CopyResource(&back, laid.as_ref().unwrap_or(texture));
             // The frame rate, into the corner of what is shown (not of the
             // title's own frame, which the lines below read back).
             crate::fpsbox::draw(self, list, &back, (width, height, format));
@@ -8648,14 +8659,16 @@ impl Host {
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+            let mut post_barriers = Vec::with_capacity(2);
+            if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+                post_barriers.push(transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state));
+            }
+            post_barriers.push(transition(
+                &back,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_PRESENT,
+            ));
+            list.ResourceBarrier(&post_barriers);
             copy.close();
             match slot {
                 Some(i) => {

@@ -136,7 +136,7 @@ fn present_behind() -> bool {
 /// the queue `this` holds. False if it has to run the old way.
 #[cfg(windows)]
 fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool {
-    if this.is_null() || planes == 0 || PRESENTS_HELD.load(Ordering::Relaxed) != 0 {
+    if this.is_null() || planes != 1 || PRESENTS_HELD.load(Ordering::Relaxed) != 0 {
         return false;
     }
     let frame = FRAMES.load(Ordering::Relaxed) + 1;
@@ -1114,13 +1114,19 @@ fn execute_now(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// A present plane (`D3D12XBOX_PRESENT_PLANE_PARAMETERS`, 72 bytes / 0x48).
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    source_rect: [i32; 4],
+    dest_rect: [i32; 4],
+    alpha_mode: u32,
+    layer_index: u32,
+    color_space: u32,
 }
+const _: () = assert!(std::mem::size_of::<Plane>() == 72);
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -1304,27 +1310,138 @@ extern "system" fn present(
     hr
 }
 
-/// The second plane's host copy, its GPU state, and the title resource, when
-/// the present carries one (`crate::compose`). The state is left in
+/// Logs plane count, resource formats, dimensions, and raw `u64` words on
+/// frame 1 for Series S or multi-plane presents so plane layout/composition
+/// can be verified in hardware logs.
+#[cfg(windows)]
+fn log_planes(frame: u64, planes: u32, plane_parameters: *const Plane) {
+    let series_s = crate::console::current() == crate::console::Console::SeriesS;
+    if planes == 0 || plane_parameters.is_null() {
+        tracing::info!(frame, planes, series_s, "PresentX called with no planes");
+        return;
+    }
+    if frame == 1 {
+        let word_count = (planes as usize * 9).min(18);
+        // SAFETY: `plane_parameters` points to `planes` 72-byte (9 u64) Plane structs.
+        let raw = unsafe { std::slice::from_raw_parts(plane_parameters.cast::<u64>(), word_count) };
+        let words: Vec<String> = raw.iter().map(|w| format!("{w:#018x}")).collect();
+        tracing::info!(frame, planes, word_count, words = ?words, "PresentX raw plane_parameters u64 words");
+    }
+    for i in 0..planes.min(4) {
+        // SAFETY: the title passes `planes` plane descriptions.
+        let Some(plane) = (unsafe { plane_parameters.add(i as usize).as_ref() }) else {
+            continue;
+        };
+        if plane.count == 0 || plane.resources.is_null() {
+            tracing::info!(
+                frame,
+                planes,
+                series_s,
+                plane = i,
+                token = plane.token,
+                count = plane.count,
+                resources_null = plane.resources.is_null(),
+                source_rect = ?plane.source_rect,
+                dest_rect = ?plane.dest_rect,
+                alpha_mode = plane.alpha_mode,
+                layer_index = plane.layer_index,
+                color_space = plane.color_space,
+                "PresentX plane has no resource"
+            );
+            continue;
+        }
+        // SAFETY: the plane lists `count` resources.
+        let resource = unsafe { *plane.resources };
+        if let Some(tex) = crate::resource::host_resource(resource) {
+            // SAFETY: live D3D12 resource.
+            let desc = unsafe { tex.GetDesc() };
+            tracing::info!(
+                frame,
+                planes,
+                series_s,
+                plane = i,
+                token = plane.token,
+                count = plane.count,
+                resource = ?resource,
+                width = desc.Width,
+                height = desc.Height,
+                format = desc.Format.0,
+                source_rect = ?plane.source_rect,
+                dest_rect = ?plane.dest_rect,
+                alpha_mode = plane.alpha_mode,
+                layer_index = plane.layer_index,
+                color_space = plane.color_space,
+                "PresentX plane"
+            );
+        } else {
+            tracing::info!(
+                frame,
+                planes,
+                series_s,
+                plane = i,
+                token = plane.token,
+                count = plane.count,
+                resource = ?resource,
+                source_rect = ?plane.source_rect,
+                dest_rect = ?plane.dest_rect,
+                alpha_mode = plane.alpha_mode,
+                layer_index = plane.layer_index,
+                color_space = plane.color_space,
+                "PresentX plane has no host texture"
+            );
+        }
+    }
+}
+
+/// The second plane's title resource, host copy, GPU state, and alpha mode
+/// (`Some(true)` premultiplied, `Some(false)` straight, `None` unspecified)
+/// when the present carries one (`crate::compose`). The state is left in
 /// `COPY_SOURCE` for the compose pass; the caller restores it after showing.
 #[cfg(windows)]
 fn second_plane(
     planes: u32,
     plane_parameters: *const Plane,
-) -> Option<(This, std::sync::Arc<crate::resource::HostTexture>, u32)> {
+) -> Option<(This, std::sync::Arc<crate::resource::HostTexture>, u32, Option<bool>)> {
     if planes < 2 || plane_parameters.is_null() {
         return None;
     }
     // SAFETY: the title passes `planes` plane descriptions.
     let plane = unsafe { plane_parameters.add(1).as_ref() }?;
     if plane.count == 0 || plane.resources.is_null() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                planes,
+                count = plane.count,
+                resources_null = plane.resources.is_null(),
+                "PresentX second plane skipped: empty resource list"
+            );
+        });
         return None;
     }
     // SAFETY: the plane lists `count` resources.
     let resource = unsafe { *plane.resources };
-    let copy = crate::resource::host_copy(resource)?;
-    let (_, before) = crate::resource::host_transition(resource, 0x800)?;
-    Some((resource, copy, before))
+    let Some(copy) = crate::resource::host_copy(resource) else {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                planes,
+                resource = ?resource,
+                "PresentX second plane skipped: no host copy for resource"
+            );
+        });
+        return None;
+    };
+    const COPY_SOURCE: u32 = 0x800;
+    let before = crate::resource::host_transition(resource, COPY_SOURCE)
+        .map_or(COPY_SOURCE, |(_, before)| before);
+    // DXGI_ALPHA_MODE: 1 = PREMULTIPLIED, 2 = STRAIGHT.
+    let premultiplied = match plane.alpha_mode {
+        1 => Some(true),
+        2 => Some(false),
+        _ => None,
+    };
+    Some((resource, copy, before, premultiplied))
 }
 
 fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESULT {
@@ -1413,6 +1530,15 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         }
     }
     #[cfg(windows)]
+    if !sent_behind {
+        if crate::console::current() == crate::console::Console::SeriesS || planes > 1 {
+            static PLANE_LOGGED: AtomicU64 = AtomicU64::new(0);
+            if PLANE_LOGGED.fetch_add(1, Ordering::Relaxed) < 4 {
+                log_planes(frame, planes, plane_parameters);
+            }
+        }
+    }
+    #[cfg(windows)]
     if !sent_behind
         && planes > 0
         // SAFETY: the title passes `planes` plane descriptions.
@@ -1430,9 +1556,9 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         let second = second_plane(planes, plane_parameters);
         let over = second
             .as_ref()
-            .map(|(_, copy, before)| (&copy.texture, *before));
+            .map(|(_, copy, before, premult)| (&copy.texture, *before, *premult));
         let shown = host.present_over(texture, state, over, frame);
-        if let Some((resource, _, before)) = second {
+        if let Some((resource, _, before, _)) = second {
             crate::resource::host_transition(resource, before);
         }
         crate::resource::host_transition(resource, state);
@@ -1703,5 +1829,127 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn plane_layout_matches_xbox_gdk_and_second_plane_reads_at_offset_0x48() {
+        assert_eq!(std::mem::size_of::<Plane>(), 72);
+        assert_eq!(std::mem::offset_of!(Plane, token), 0x00);
+        assert_eq!(std::mem::offset_of!(Plane, count), 0x08);
+        assert_eq!(std::mem::offset_of!(Plane, resources), 0x10);
+        assert_eq!(std::mem::offset_of!(Plane, source_rect), 0x18);
+        assert_eq!(std::mem::offset_of!(Plane, dest_rect), 0x28);
+        assert_eq!(std::mem::offset_of!(Plane, alpha_mode), 0x38);
+        assert_eq!(std::mem::offset_of!(Plane, layer_index), 0x3c);
+        assert_eq!(std::mem::offset_of!(Plane, color_space), 0x40);
+
+        assert!(second_plane(1, std::ptr::null()).is_none());
+        let empty = [
+            Plane {
+                token: 0,
+                count: 0,
+                resources: std::ptr::null(),
+                source_rect: [0; 4],
+                dest_rect: [0; 4],
+                alpha_mode: 0,
+                layer_index: 0,
+                color_space: 0,
+            },
+            Plane {
+                token: 0,
+                count: 0,
+                resources: std::ptr::null(),
+                source_rect: [0; 4],
+                dest_rect: [0; 4],
+                alpha_mode: 0,
+                layer_index: 0,
+                color_space: 0,
+            },
+        ];
+        assert_eq!(
+            (&raw const empty[1] as usize) - (&raw const empty[0] as usize),
+            0x48
+        );
+        assert!(second_plane(2, empty.as_ptr()).is_none());
+
+        // Skip host-copy portion if no host D3D12 device is available.
+        if crate::host::host().is_none() {
+            return;
+        }
+        let tex0 = crate::resource::test_texture(16, 16, 28, 0x800);
+        let tex1_copy_source = crate::resource::test_texture(32, 32, 87, 0x800);
+        let planes = [
+            Plane {
+                token: 1,
+                count: 1,
+                resources: &tex0,
+                source_rect: [0, 0, 1920, 1080],
+                dest_rect: [0, 0, 3840, 2160],
+                alpha_mode: 0,
+                layer_index: 0,
+                color_space: 0,
+            },
+            Plane {
+                token: 1,
+                count: 1,
+                resources: &tex1_copy_source,
+                source_rect: [0, 0, 3840, 2160],
+                dest_rect: [0, 0, 3840, 2160],
+                alpha_mode: 1,
+                layer_index: 1,
+                color_space: 0,
+            },
+        ];
+        // Verify raw byte offset 0x48 holds Plane 1's resources pointer.
+        // SAFETY: `planes` is a 2-element array of 72-byte Plane structs.
+        let plane1_ptr_at_0x48 = unsafe {
+            planes
+                .as_ptr()
+                .cast::<u8>()
+                .add(0x48 + 0x10)
+                .cast::<*const This>()
+                .read()
+        };
+        assert_eq!(plane1_ptr_at_0x48, planes[1].resources);
+
+        // When Plane 1 is already in COPY_SOURCE (0x800), host_transition(_, 0x800) returns None;
+        // second_plane must still succeed with state 0x800 and premultiplied=Some(true) for alpha_mode=1.
+        let (res0, _, state, premult) = second_plane(2, planes.as_ptr())
+            .expect("second_plane should succeed when Plane 1 is already in COPY_SOURCE (0x800)");
+        assert_eq!(res0, tex1_copy_source);
+        assert_eq!(state, 0x800);
+        assert_eq!(premult, Some(true));
+
+        // When Plane 1 starts in RENDER_TARGET (0x4) with straight alpha_mode=2, report 0x4 and Some(false).
+        let tex1_rt = crate::resource::test_texture(32, 32, 24, 0x4);
+        let planes_rt = [
+            Plane {
+                token: 2,
+                count: 1,
+                resources: &tex0,
+                source_rect: [0, 0, 1920, 1080],
+                dest_rect: [0, 0, 3840, 2160],
+                alpha_mode: 0,
+                layer_index: 0,
+                color_space: 0,
+            },
+            Plane {
+                token: 2,
+                count: 1,
+                resources: &tex1_rt,
+                source_rect: [0, 0, 3840, 2160],
+                dest_rect: [0, 0, 3840, 2160],
+                alpha_mode: 2,
+                layer_index: 1,
+                color_space: 0,
+            },
+        ];
+        let (res, _, before, premult_rt) = second_plane(2, planes_rt.as_ptr())
+            .expect("second_plane should succeed when Plane 1 is in RENDER_TARGET (0x4)");
+        assert_eq!(res, tex1_rt);
+        assert_eq!(before, 0x4);
+        assert_eq!(premult_rt, Some(false));
+        crate::resource::host_transition(res, before);
     }
 }
