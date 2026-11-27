@@ -5616,6 +5616,19 @@ impl<'a> Lower<'a> {
                     }
                     Ok(())
                 }
+                "s_cmov_b64" => {
+                    // RDNA2 ISA: if SCC, D = S0; else D keeps its value.
+                    let cond = self.scc_in(inst)?;
+                    let code = dst_code.ok_or("a missing operand")?;
+                    for (h, v) in [(0, lo), (1, hi)] {
+                        let old = inst.read(Reg::S(code + h)).ok_or("an unread operand")?;
+                        let old = self.i32_of(old)?;
+                        let new = half(self, 0, h)?;
+                        let r = self.s.m.select(c, cond, new, old);
+                        self.set(v, Val::I32(r));
+                    }
+                    Ok(())
+                }
                 "s_cselect_b64" => {
                     let cond = self.scc_in(inst)?;
                     for (h, v) in [(0, lo), (1, hi)] {
@@ -5637,6 +5650,18 @@ impl<'a> Lower<'a> {
                 let cond = self.scc_in(inst)?;
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 (self.s.m.select(c, cond, a, b), None)
+            }
+            "s_cmov_b32" | "s_cmovk_i32" => {
+                // RDNA2 ISA: if SCC, D = S0 (s_cmovk: the sign-extended
+                // 16-bit immediate); else D keeps its value.
+                let cond = self.scc_in(inst)?;
+                let old = self.operand(inst, dst.as_ref().ok_or("a missing operand")?)?;
+                let new = if name == "s_cmovk_i32" {
+                    sext16(self)
+                } else {
+                    src32(self, 0)?
+                };
+                (self.s.m.select(c, cond, new, old), None)
             }
             "s_brev_b32" => {
                 let a = src32(self, 0)?;
@@ -11732,6 +11757,52 @@ mod tests {
         // Invalid, past the table.
         assert_eq!(buffer_format(0), None);
         assert_eq!(buffer_format(78), None);
+    }
+
+    /// `s_cmov_b32`, `s_cmov_b64` and `s_cmovk_i32` decode and translate after
+    /// `s_cmp_eq_u32 s0, s1`, over an `s[12:13]` set before, in a program that
+    /// stores the result (`s12` moved to `v0`).
+    #[test]
+    fn scalar_conditional_moves_translate() {
+        let program = |body: &[u32]| {
+            let mut words = vec![
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0xFA00_0000,
+            ];
+            // v_mov_b32 v1..v4, s0..s3
+            words.extend((0..4u32).map(|i| 0x7E00_0200 | (i + 1) << 17 | i));
+            // s_mov_b32 s12, s3; s_mov_b32 s13, s2; s_cmp_eq_u32 s0, s1
+            words.extend([0xBE8C_0303, 0xBE8D_0302, 0xBF06_0100]);
+            words.extend(body);
+            words.push(0x7E00_020C); // v_mov_b32 v0, s12
+            words.extend([0xE070_0000, 0x8002_0000, S_ENDPGM]); // buffer_store_dword v0
+            words
+        };
+        let buffer = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let constants = RootParam { sgprs: 4, ..root(RootType::Constants, 0, 0) };
+        for (body, name) in [
+            (&[0xBE8C_0502][..], "s_cmov_b32"), // s_cmov_b32 s12, s2
+            (&[0xBE8C_0602], "s_cmov_b64"),      // s_cmov_b64 s[12:13], s[2:3]
+            (&[0xB10C_8000], "s_cmovk_i32"),     // s_cmovk_i32 s12, 0x8000
+        ] {
+            let code: Vec<u8> = program(body).iter().flat_map(|w| w.to_le_bytes()).collect();
+            let insts = crate::gfx10::decode(&code).unwrap();
+            let names: Vec<_> = insts.iter().map(|i| i.name()).collect();
+            assert!(names.contains(&Some(name)), "{names:?}");
+            let layout = vec![constants, root(RootType::Table, 4, 1)];
+            lower_with(&program(body), layout, vec![buffer])
+                .unwrap_or_else(|e| panic!("{name} {body:08x?}: {e}"));
+        }
     }
 
     #[test]

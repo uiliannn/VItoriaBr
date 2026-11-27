@@ -639,6 +639,30 @@ fn v_fract_f32_never_returns_one() {
 }
 
 #[test]
+fn scalar_conditional_moves_keep_the_destination_when_scc_is_clear() {
+    // s_mov_b32 s12, s3; s_mov_b32 s13, s2; s_cmp_eq_u32 s0, s1; then the
+    // conditional move; v_mov_b32 v0, s12 (or s13). SCC = (s0 == s1).
+    let head = [0xBE8C_0303u32, 0xBE8D_0302, 0xBF06_0100];
+    let cases = [[7u32, 7, 0x1111_1111, 0x2222_2222], [7, 8, 0x1111_1111, 0x2222_2222]];
+    type Want = fn([u32; 4], bool) -> u32;
+    let moves: [(&str, u32, u8, Want); 4] = [
+        ("s_cmov_b32", 0xBE8C_0502, 12, |x, scc| if scc { x[2] } else { x[3] }),
+        ("s_cmov_b64 (low)", 0xBE8C_0602, 12, |x, scc| if scc { x[2] } else { x[3] }),
+        ("s_cmov_b64 (high)", 0xBE8C_0602, 13, |x, scc| if scc { x[3] } else { x[2] }),
+        ("s_cmovk_i32", 0xB10C_8000, 12, |x, scc| if scc { 0xFFFF_8000 } else { x[3] }),
+    ];
+    for (name, mov, read, want) in moves {
+        let mut body = head.to_vec();
+        body.extend([mov, vop1(0x001, 0, sgpr(read))]);
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, &cases, |backend, i, inp, got| {
+            let want = want(inp, inp[0] == inp[1]);
+            assert_eq!(got, want, "{backend}: {name} case {i} got {got:#010x}, want {want:#010x}");
+        });
+    }
+}
+
+#[test]
 fn v_fract_f16_never_returns_one() {
     // v_fract_f16 v0, v1 (VOP1 opcode 0x05f)
     let shader = build_valu_cs(&[vop1(0x05f, 0, vgpr(1))]);
