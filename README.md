@@ -118,6 +118,8 @@ cargo build --release -p victory
 
 > Pré-compilação de shaders (`victory warm`), o que ela cobre e como conferir no log: [docs/precompilacao-shaders.md](docs/precompilacao-shaders.md).
 
+Para registrar testes selecionados, veja [relatórios locais de testes](docs/test-report.md).
+
 ### Preset recomendado (testado na RTX 5060 Ti 16 GB — até `6 fps`)
 ```powershell
 # Opcional (1x por atualização): pré-aquece todo o cache de shaders antes de abrir o título
@@ -293,6 +295,8 @@ Measured via `victory translate --validate --pipelines` (`dxil.dll` Windows SDK 
 > **Warning:** Entering the 3D world on a real GPU can still trigger a display driver reset (TDR). Use a `diag` build with `VICTORY_D3D12_WARP=1` to inspect safely on the software adapter.
 
 ### Quick Start
+
+See [local test reports](docs/test-report.md) to capture results for selected tests.
 
 ```powershell
 copy victory.example.toml victory.toml   # set paths outside the repository
