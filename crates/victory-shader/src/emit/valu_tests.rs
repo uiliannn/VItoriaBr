@@ -1308,6 +1308,18 @@ fn ds_min_max_f32_order_floats_and_return_the_old_value() {
 }
 
 #[test]
+fn v_cvt_off_f32_i4_matches_the_isa_table() {
+    // AMD's table: 1000 -> -0.5 ... 1111 -> -0.0625, 0000 -> 0 ... 0111 ->
+    // 0.4375; only bits 3:0 count.
+    let shader = build_valu_cs(&[vop1(0x00E, 0, vgpr(1))]);
+    let inputs: Vec<[u32; 4]> = (0..16u32).map(|n| [0xABCD_EF00 | n, 0, 0, 0]).collect();
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        let want = (((i as i32) << 28 >> 28) as f32 / 16.0).to_bits();
+        assert_eq!(got, want, "{backend}: v_cvt_off_f32_i4({i:#x}) = {got:#010x}, want {want:#010x}");
+    });
+}
+
+#[test]
 fn ds_min_max_f32_are_atomic_across_waves() {
     // 64 threads (two host waves of 32 or one of 64): LDS[0] = v1, then
     // every thread applies (thread - 32) as a float; v0 = LDS[0].

@@ -7786,6 +7786,17 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.cast(c, op, a, self.s.t.f32);
                 float(self, r)
             }
+            "v_cvt_off_f32_i4" => {
+                // RDNA2 ISA: S0[3:0] as a signed nibble, over 16 (-0.5 for
+                // 1000 to 0.4375 for 0111), exactly.
+                let a = s(self, 0)?;
+                let (k28, sixteenth) = (self.s.m.i32(28), self.s.m.f32(0.0625f32.to_bits()));
+                let n = self.s.m.bin(c, Bin::Shl, a, k28);
+                let n = self.s.m.bin(c, Bin::AShr, n, k28);
+                let f = self.s.m.cast(c, Cast::SiToFp, n, self.s.t.f32);
+                let r = self.s.m.bin(c, Bin::Mul, f, sixteenth);
+                float(self, r)
+            }
             "v_cvt_f32_f64" => {
                 let (lo, hi) = self.f64_pair(inst, 0)?;
                 let bits = self.f64_to_f32_bits(lo, hi);
@@ -11100,6 +11111,47 @@ mod tests {
             super::super::TEST_GROUP_SYNC.set(old_mode);
             let shader = shader.unwrap_or_else(|e| panic!("wave64={wave64}, host={host}: {e:?}"));
             assert_eq!(shader.barrier_modes, vec![expected]);
+        }
+    }
+
+    /// `v_cvt_off_f32_i4` decodes (VOP1 and VOP3) and translates in a program
+    /// that stores the result.
+    #[test]
+    fn nibble_offset_conversion_translates() {
+        let program = |body: [u32; 2]| {
+            let mut words = vec![
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0xFA00_0000,
+            ];
+            // v_mov_b32 v1..v4, s0..s3
+            words.extend((0..4u32).map(|i| 0x7E00_0200 | (i + 1) << 17 | i));
+            words.extend(body);
+            words.extend([0xE070_0000, 0x8002_0000, S_ENDPGM]); // buffer_store_dword v0
+            words
+        };
+        let buffer = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let constants = RootParam { sgprs: 4, ..root(RootType::Constants, 0, 0) };
+        for (body, name) in [
+            ([0x7E00_0000 | 0x0E << 9 | 0x101, 0x7E00_0000], "v_cvt_off_f32_i4"),
+            ([0xD400_0000 | 0x18E << 16, 0x101], "v_cvt_off_f32_i4"),
+        ] {
+            let code: Vec<u8> = program(body).iter().flat_map(|w| w.to_le_bytes()).collect();
+            let insts = crate::gfx10::decode(&code).unwrap();
+            let names: Vec<_> = insts.iter().map(|i| i.name()).collect();
+            assert!(names.contains(&Some(name)), "{names:?}");
+            let layout = vec![constants, root(RootType::Table, 4, 1)];
+            lower_with(&program(body), layout, vec![buffer])
+                .unwrap_or_else(|e| panic!("{name} {body:08x?}: {e}"));
         }
     }
 
