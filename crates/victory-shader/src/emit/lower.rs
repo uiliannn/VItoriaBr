@@ -3665,6 +3665,110 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, zeros, signed, r)
     }
 
+    /// `(lo, hi)`, a binary64, rounded to an integral value: toward zero
+    /// (`v_trunc_f64`), down, up, or to nearest even. With `u` the unbiased
+    /// exponent, the units bit of the 63-bit magnitude is bit `52 - u`:
+    /// below it are the fraction bits, and adding it (carrying into the
+    /// exponent as IEEE's encoding allows) steps the magnitude by one. A
+    /// magnitude below 1 rounds to 0 or 1 with the sign kept; 2^52 and up,
+    /// infinities and NaNs (made quiet) are already integral.
+    fn f64_round(&mut self, lo: V, hi: V, name: &str) -> (V, V) {
+        let c = self.cur;
+        let i64t = self.s.m.int(64);
+        self.s.flags |= flags::INT64;
+        let q = |l: &mut Self, x: i64| l.s.m.int_const(i64t, x);
+        let lo64 = self.s.m.cast(c, Cast::ZExt, lo, i64t);
+        let hi64 = self.s.m.cast(c, Cast::ZExt, hi, i64t);
+        let k32 = q(self, 32);
+        let hi64 = self.s.m.bin(c, Bin::Shl, hi64, k32);
+        let bits = self.s.m.bin(c, Bin::Or, hi64, lo64);
+        let sign_mask = q(self, i64::MIN);
+        let sign = self.s.m.bin(c, Bin::And, bits, sign_mask);
+        let mag_mask = q(self, i64::MAX);
+        let mag = self.s.m.bin(c, Bin::And, bits, mag_mask);
+        let z = q(self, 0);
+        let negative = self.s.m.cmp(c, pred::NE, sign, z);
+        let (k52, k7ff) = (q(self, 52), q(self, 0x7FF));
+        let e = self.s.m.bin(c, Bin::LShr, mag, k52);
+        let e = self.s.m.bin(c, Bin::And, e, k7ff);
+        let (zero, one) = (q(self, 0), q(self, 1));
+        // 1 <= |x| < 2^52: e in [1023, 1074]; fb = 1075 - e fraction bits.
+        let k1075 = q(self, 1075);
+        let fb = self.s.m.bin(c, Bin::Sub, k1075, e);
+        let (k1, k52b) = (q(self, 1), q(self, 52));
+        // (Clamped to [1, 52] so the shifts stay in range; out of it the
+        // small and big cases below take over.)
+        let under = self.s.m.cmp(c, pred::SLT, fb, k1);
+        let fb = self.s.m.select(c, under, k1, fb);
+        let over = self.s.m.cmp(c, pred::SGT, fb, k52b);
+        let fb = self.s.m.select(c, over, k52b, fb);
+        let unit = self.s.m.bin(c, Bin::Shl, one, fb);
+        let low = self.s.m.bin(c, Bin::Sub, unit, one);
+        let rem = self.s.m.bin(c, Bin::And, mag, low);
+        let all = q(self, -1);
+        let keep = self.s.m.bin(c, Bin::Xor, low, all);
+        let t = self.s.m.bin(c, Bin::And, mag, keep);
+        let frac = self.s.m.cmp(c, pred::NE, rem, zero);
+        let up = match name {
+            "v_trunc_f64" => self.s.m.bool(false),
+            // Away from zero for a negative value (floor), positive (ceil).
+            "v_floor_f64" => self.s.m.bin(c, Bin::And, frac, negative),
+            "v_ceil_f64" => {
+                let yes = self.s.m.bool(true);
+                let positive = self.s.m.bin(c, Bin::Xor, negative, yes);
+                self.s.m.bin(c, Bin::And, frac, positive)
+            }
+            _ => {
+                let half = self.s.m.bin(c, Bin::LShr, unit, one);
+                let above = self.s.m.cmp(c, pred::IUGT, rem, half);
+                let tie = self.s.m.cmp(c, pred::EQ, rem, half);
+                let odd = self.s.m.bin(c, Bin::And, t, unit);
+                let odd = self.s.m.cmp(c, pred::NE, odd, zero);
+                let tie_up = self.s.m.bin(c, Bin::And, tie, odd);
+                self.s.m.bin(c, Bin::Or, above, tie_up)
+            }
+        };
+        let step = self.s.m.select(c, up, unit, zero);
+        let r = self.s.m.bin(c, Bin::Add, t, step);
+        // |x| < 1 (e < 1023): 0, or 1 where the rounding goes away from zero.
+        let k1023 = q(self, 1023);
+        let small = self.s.m.cmp(c, pred::IULT, e, k1023);
+        let nonzero = self.s.m.cmp(c, pred::NE, mag, zero);
+        let small_up = match name {
+            "v_trunc_f64" => self.s.m.bool(false),
+            "v_floor_f64" => self.s.m.bin(c, Bin::And, nonzero, negative),
+            "v_ceil_f64" => {
+                let yes = self.s.m.bool(true);
+                let positive = self.s.m.bin(c, Bin::Xor, negative, yes);
+                self.s.m.bin(c, Bin::And, nonzero, positive)
+            }
+            // Above one half (e = 1022 and a non-zero fraction).
+            _ => {
+                let half = q(self, 0x3FE0_0000_0000_0000);
+                self.s.m.cmp(c, pred::IUGT, mag, half)
+            }
+        };
+        let one_f = q(self, 0x3FF0_0000_0000_0000);
+        let small_r = self.s.m.select(c, small_up, one_f, zero);
+        let r = self.s.m.select(c, small, small_r, r);
+        // 2^52 and up (e >= 1075): unchanged; NaN made quiet.
+        let big = self.s.m.cmp(c, pred::IUGE, e, k1075);
+        let r = self.s.m.select(c, big, mag, r);
+        let is_special = self.s.m.cmp(c, pred::EQ, e, k7ff);
+        let frac_mask = q(self, 0xF_FFFF_FFFF_FFFF);
+        let payload = self.s.m.bin(c, Bin::And, mag, frac_mask);
+        let has_payload = self.s.m.cmp(c, pred::NE, payload, zero);
+        let nan = self.s.m.bin(c, Bin::And, is_special, has_payload);
+        let quiet = q(self, 0x8_0000_0000_0000);
+        let quieted = self.s.m.bin(c, Bin::Or, r, quiet);
+        let r = self.s.m.select(c, nan, quieted, r);
+        let r = self.s.m.bin(c, Bin::Or, r, sign);
+        let rl = self.s.m.cast(c, Cast::Trunc, r, self.s.t.i32);
+        let rh = self.s.m.bin(c, Bin::LShr, r, k32);
+        let rh = self.s.m.cast(c, Cast::Trunc, rh, self.s.t.i32);
+        (rl, rh)
+    }
+
     fn fmad(&mut self, a: V, b: V, c: V) -> V {
         self.s.op(
             self.cur,
@@ -7455,6 +7559,22 @@ impl<'a> Lower<'a> {
                     .s
                     .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a]);
                 int(self, r)
+            }
+            "v_trunc_f64" | "v_floor_f64" | "v_ceil_f64" | "v_rndne_f64" => {
+                // IEEE roundings of a binary64 to an integral value (AMD's
+                // RDNA2 ISA), on the bits in 64-bit integers, without host
+                // doubles (DXIL's rounding operations take no doubles).
+                if v.clamp || v.omod != 0 {
+                    return Err("f64 output modifiers");
+                }
+                let (lo, hi) = self.f64_pair(inst, 0)?;
+                let (lo, hi) = self.f64_round(lo, hi, name);
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("a 64-bit result");
+                };
+                self.write(inst, Reg::V(reg), lo, guard);
+                self.write(inst, Reg::V(reg + 1), hi, guard);
+                Ok(())
             }
             "v_mov_b32" => {
                 if v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 {
@@ -11681,6 +11801,50 @@ mod tests {
         for head in bit_tests {
             let words: Vec<u32> = head.iter().chain(&tail).copied().collect();
             lowers(&words, 0).unwrap();
+        }
+    }
+
+    /// `v_trunc_f64`, `v_floor_f64`, `v_ceil_f64` and `v_rndne_f64` decode and
+    /// translate in a program that stores the result (`v[5:6]`, its high
+    /// dword moved to `v0`).
+    #[test]
+    fn f64_roundings_translate() {
+        let program = |body: [u32; 2]| {
+            let mut words = vec![
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0xFA00_0000,
+            ];
+            // v_mov_b32 v1..v4, s0..s3
+            words.extend((0..4u32).map(|i| 0x7E00_0200 | (i + 1) << 17 | i));
+            words.extend(body);
+            words.extend([0xE070_0000, 0x8002_0000, S_ENDPGM]); // buffer_store_dword v0
+            words
+        };
+        let buffer = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let constants = RootParam { sgprs: 4, ..root(RootType::Constants, 0, 0) };
+        for (body, name) in [
+            ([0x7E00_0000 | 5 << 17 | 0x17 << 9 | 0x101, 0x7E00_0306], "v_trunc_f64"),
+            ([0x7E00_0000 | 5 << 17 | 0x18 << 9 | 0x101, 0x7E00_0306], "v_ceil_f64"),
+            ([0x7E00_0000 | 5 << 17 | 0x19 << 9 | 0x101, 0x7E00_0306], "v_rndne_f64"),
+            ([0x7E00_0000 | 5 << 17 | 0x1A << 9 | 0x101, 0x7E00_0306], "v_floor_f64"),
+        ] {
+            let code: Vec<u8> = program(body).iter().flat_map(|w| w.to_le_bytes()).collect();
+            let insts = crate::gfx10::decode(&code).unwrap();
+            let names: Vec<_> = insts.iter().map(|i| i.name()).collect();
+            assert!(names.contains(&Some(name)), "{names:?}");
+            let layout = vec![constants, root(RootType::Table, 4, 1)];
+            lower_with(&program(body), layout, vec![buffer])
+                .unwrap_or_else(|e| panic!("{name} {body:08x?}: {e}"));
         }
     }
 

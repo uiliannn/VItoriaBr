@@ -1501,6 +1501,30 @@ fn v_cvt_f32_f64_matches_ieee754() {
 }
 
 #[test]
+fn f64_roundings_match_ieee() {
+    // v_<op>_f64 v[5:6], v[1:2]; v_mov_b32 v0, v5 or v6.
+    let d = |x: f64| [x.to_bits() as u32, (x.to_bits() >> 32) as u32];
+    let xs = [0.0f64, -0.0, 0.3, -0.3, 0.5, -0.5, 0.7, 1.5, 2.5, -2.5, 3.7, -3.7, 4503599627370495.5, 1e300, f64::INFINITY, f64::NEG_INFINITY];
+    let inputs: Vec<[u32; 4]> = xs.iter().map(|&x| { let b = d(x); [b[0], b[1], 0, 0] }).collect();
+    type Round = fn(f64) -> f64;
+    let ops: [(u32, &str, Round); 4] = [
+        (0x17, "v_trunc_f64", f64::trunc),
+        (0x18, "v_ceil_f64", f64::ceil),
+        (0x19, "v_rndne_f64", f64::round_ties_even),
+        (0x1A, "v_floor_f64", f64::floor),
+    ];
+    for (op, name, f) in ops {
+        for (h, src) in [(0, 5u8), (1, 6)] {
+            let shader = build_valu_cs(&[0x7E00_0000 | 5 << 17 | op << 9 | 0x101, vop1(0x001, 0, vgpr(src))]);
+            run_cases(&shader, &inputs, |backend, i, _, got| {
+                let want = d(f(xs[i]))[h];
+                assert_eq!(got, want, "{backend}: {name}({}) dword {h} = {got:#010x}, want {want:#010x}", xs[i]);
+            });
+        }
+    }
+}
+
+#[test]
 fn whole_wave_f64_sum_and_cvt_f32_f64() {
     let s_or_saveexec_b32 =
         |sdst: u8, src0: u8| 0xBE80_0000 | (sdst as u32) << 16 | 0x3D << 8 | src0 as u32;
