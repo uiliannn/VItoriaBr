@@ -273,6 +273,34 @@ fn is_f16_nan(bits: u16) -> bool {
     (bits & 0x7FFF) > 0x7C00
 }
 
+#[test]
+fn f64_compares_match_ieee() {
+    // v_cmp_<op>_f64 vcc, v[1:2], v[3:4]; v_cndmask_b32 v0, 0, 1, vcc.
+    let d = |x: f64| [x.to_bits() as u32, (x.to_bits() >> 32) as u32];
+    let pairs = [(1.0f64, 2.0f64), (2.0, 1.0), (3.0, 3.0), (f64::NAN, 1.0), (-0.0, 0.0), (1.0, 1.0 + f64::EPSILON)];
+    let inputs: Vec<[u32; 4]> = pairs.iter().map(|&(a, b)| { let (a, b) = (d(a), d(b)); [a[0], a[1], b[0], b[1]] }).collect();
+    type Pred = fn(f64, f64) -> bool;
+    let ops: [(u32, &str, Pred); 8] = [
+        (0x21, "v_cmp_lt_f64", |a, b| a < b),
+        (0x22, "v_cmp_eq_f64", |a, b| a == b),
+        (0x24, "v_cmp_gt_f64", |a, b| a > b),
+        // Ordered and unequal (`a != b` would be true for a NaN).
+        (0x25, "v_cmp_lg_f64", |a, b| a.partial_cmp(&b).is_some_and(|o| o.is_ne())),
+        (0x27, "v_cmp_o_f64", |a, b| !(a.is_nan() || b.is_nan())),
+        (0x28, "v_cmp_u_f64", |a, b| a.is_nan() || b.is_nan()),
+        (0x2D, "v_cmp_neq_f64", |a, b| a != b),
+        (0x2E, "v_cmp_nlt_f64", |a, b| a >= b || a.is_nan() || b.is_nan()),
+    ];
+    for (op, name, p) in ops {
+        let shader = build_valu_cs(&[0x7C00_0000 | op << 17 | 3 << 9 | 0x101, 0xD501_0000, 0x80 | 0x81 << 9 | 0x6A << 18]);
+        run_cases(&shader, &inputs, |backend, i, _, got| {
+            let (a, b) = pairs[i];
+            let want = u32::from(p(a, b));
+            assert_eq!(got, want, "{backend}: {name}({a}, {b}) = {got}, want {want}");
+        });
+    }
+}
+
 fn f16_to_f32(bits: u16) -> f32 {
     let sign = u32::from(bits >> 15) << 31;
     let exp = (bits >> 10) & 0x1F;

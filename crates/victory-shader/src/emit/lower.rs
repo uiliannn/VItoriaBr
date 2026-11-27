@@ -9484,6 +9484,82 @@ impl<'a> Lower<'a> {
                     self.s.m.cmp(c, p, a, b)
                 }
             }
+            "f64" if op == "class" => {
+                // As for f32 above, on the binary64's bits: the exponent
+                // and the top of the mantissa (with the quiet bit) are in
+                // the high dword.
+                let (lo, x) = self.f64_pair(inst, 0)?;
+                let mask = self.src(inst, 1)?;
+                let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+                let (k20, k31, k_emax, mant_hi) =
+                    (k(self, 20), k(self, 31), k(self, 0x7FF), k(self, 0xF_FFFF));
+                let e = self.s.m.bin(c, Bin::LShr, x, k20);
+                let e = self.s.m.bin(c, Bin::And, e, k_emax);
+                let m = self.s.m.bin(c, Bin::And, x, mant_hi);
+                let m = self.s.m.bin(c, Bin::Or, m, lo);
+                let neg = self.s.m.bin(c, Bin::LShr, x, k31);
+                let zero = k(self, 0);
+                let e0 = self.s.m.cmp(c, pred::EQ, e, zero);
+                let emax = self.s.m.cmp(c, pred::EQ, e, k_emax);
+                let m0 = self.s.m.cmp(c, pred::EQ, m, zero);
+                let quiet = k(self, 0x8_0000);
+                let q = self.s.m.bin(c, Bin::And, x, quiet);
+                let q = self.s.m.cmp(c, pred::NE, q, zero);
+                let (normal, inf, zero_c, denorm) =
+                    (k(self, 8), k(self, 9), k(self, 6), k(self, 7));
+                let t = self.s.m.select(c, m0, zero_c, denorm);
+                let t = self.s.m.select(c, e0, t, normal);
+                let t = self.s.m.select(c, emax, inf, t);
+                let eleven = k(self, 11);
+                let mirrored = self.s.m.bin(c, Bin::Sub, eleven, t);
+                let is_neg = self.s.m.cmp(c, pred::NE, neg, zero);
+                let t = self.s.m.select(c, is_neg, mirrored, t);
+                let (one, snan) = (k(self, 1), k(self, 0));
+                let nan_class = self.s.m.select(c, q, one, snan);
+                let yes = self.s.m.bool(true);
+                let nan = self.s.m.bin(c, Bin::Xor, m0, yes);
+                let nan = self.s.m.bin(c, Bin::And, nan, emax);
+                let t = self.s.m.select(c, nan, nan_class, t);
+                let bit = self.s.m.bin(c, Bin::LShr, mask, t);
+                let bit = self.s.m.bin(c, Bin::And, bit, one);
+                self.s.m.cmp(c, pred::NE, bit, zero)
+            }
+            "f64" => {
+                // The f32 predicates on the host's doubles (the operand
+                // pairs, with abs/neg, joined by MakeDouble).
+                self.s.flags |= flags::DOUBLES;
+                let f64t = self.s.m.double();
+                let (alo, ahi) = self.f64_pair(inst, 0)?;
+                let (blo, bhi) = self.f64_pair(inst, 1)?;
+                let a = self.s.op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[alo, ahi]);
+                let b = self.s.op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[blo, bhi]);
+                if op == "lg" {
+                    // Ordered and not equal, as for f32 (see there).
+                    let lt = self.s.m.cmp(c, pred::OLT, a, b);
+                    let gt = self.s.m.cmp(c, pred::OGT, a, b);
+                    self.s.m.bin(c, Bin::Or, lt, gt)
+                } else {
+                    let p = match op {
+                        "f" => pred::FALSE,
+                        "lt" => pred::OLT,
+                        "eq" => pred::OEQ,
+                        "le" => pred::OLE,
+                        "gt" => pred::OGT,
+                        "ge" => pred::OGE,
+                        "o" => pred::ORD,
+                        "u" => pred::UNO,
+                        "nge" => pred::ULT,
+                        "nlg" => pred::UEQ,
+                        "ngt" => pred::ULE,
+                        "nle" => pred::UGT,
+                        "neq" => pred::UNE,
+                        "nlt" => pred::UGE,
+                        "tru" => pred::TRUE,
+                        _ => return Err(inst.name()),
+                    };
+                    self.s.m.cmp(c, p, a, b)
+                }
+            }
             "u64" | "i64" => {
                 let (a, b) = (self.src64(inst, 0)?, self.src64(inst, 1)?);
                 let signed = ty == "i64";
@@ -11223,6 +11299,51 @@ mod tests {
         assert_eq!(at(3, 7), None);
         // A row no element holds gives nothing, as before.
         assert_eq!(packed_half(&sig, &[(8, None)], 8, 0), None);
+    }
+
+    /// The f64 compares (`v_cmp_*_f64`, `v_cmpx_*_f64`, `v_cmp_class_f64`) decode
+    /// and translate in a program that stores what they decide (VOPC to VCC
+    /// then `v_cndmask_b32`; `v_cmpx` to EXEC then a store under it).
+    #[test]
+    fn f64_compares_translate() {
+        let program = |body: &[u32]| {
+            let mut words = vec![
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0xFA00_0000,
+            ];
+            // v_mov_b32 v1..v4, s0..s3
+            words.extend((0..4u32).map(|i| 0x7E00_0200 | (i + 1) << 17 | i));
+            words.extend(body);
+            words.extend([0xE070_0000, 0x8002_0000, S_ENDPGM]); // buffer_store_dword v0
+            words
+        };
+        let buffer = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let constants = RootParam { sgprs: 4, ..root(RootType::Constants, 0, 0) };
+        for (body, name) in [
+            (&[0x7C00_0000 | 0x21 << 17 | 3 << 9 | 0x101, 0xD501_0000, 0x80 | 0x81 << 9 | 0x6A << 18][..], "v_cmp_lt_f64"),
+            (&[0x7C00_0000 | 0x25 << 17 | 3 << 9 | 0x101, 0xD501_0000, 0x80 | 0x81 << 9 | 0x6A << 18], "v_cmp_lg_f64"),
+            (&[0x7C00_0000 | 0x2D << 17 | 3 << 9 | 0x101, 0xD501_0000, 0x80 | 0x81 << 9 | 0x6A << 18], "v_cmp_neq_f64"),
+            (&[0x7C00_0000 | 0xA8 << 17 | 3 << 9 | 0x101, 0xD501_0000, 0x80 | 0x81 << 9 | 0x6A << 18], "v_cmp_class_f64"),
+            (&[0x7C00_0000 | 0x34 << 17 | 3 << 9 | 0x101, 0x7E00_0303], "v_cmpx_gt_f64"),
+        ] {
+            let code: Vec<u8> = program(body).iter().flat_map(|w| w.to_le_bytes()).collect();
+            let insts = crate::gfx10::decode(&code).unwrap();
+            let names: Vec<_> = insts.iter().map(|i| i.name()).collect();
+            assert!(names.contains(&Some(name)), "{names:?}");
+            let layout = vec![constants, root(RootType::Table, 4, 1)];
+            lower_with(&program(body), layout, vec![buffer])
+                .unwrap_or_else(|e| panic!("{name} {body:08x?}: {e}"));
+        }
     }
 
     /// `v_dot8_i32_i4 v0, v1, v2, v3` decodes, and translates (clamped too)
