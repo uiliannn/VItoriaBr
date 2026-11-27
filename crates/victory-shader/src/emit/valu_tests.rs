@@ -473,6 +473,24 @@ fn v_med3_f32_matches_rdna2_with_nan() {
 /// RDNA2 orders -0 below +0 in its maximums and minimums; DXIL's FMax and
 /// FMin compare and select, which can give either zero.
 #[test]
+fn scalar_absolute_difference_matches_rdna2() {
+    // s_absdiff_i32 s12, s0, s1; then v0 = s12, or v0 = SCC through
+    // s_cselect_b32 s13, 1, 0 (SCC = result != 0).
+    let absdiff = sop2(0x2C, 12, 0, 1);
+    let cases = [[3u32, 10, 0, 0], [10, 3, 0, 0], [0xFFFF_FFFB, 5, 0, 0], [7, 7, 0, 0], [0x8000_0000, 0, 0, 0]];
+    let want = [7u32, 7, 10, 0, 0x8000_0000];
+    let value = build_valu_cs(&[absdiff, vop1(0x001, 0, sgpr(12))]);
+    run_cases(&value, &cases, |backend, i, _, got| {
+        assert_eq!(got, want[i], "{backend}: s_absdiff_i32 case {i} got {got:#010x}, want {:#010x}", want[i]);
+    });
+    let scc = build_valu_cs(&[absdiff, sop2(0x0A, 13, 0x81, 0x80), vop1(0x001, 0, sgpr(13))]);
+    run_cases(&scc, &cases, |backend, i, _, got| {
+        let want = u32::from(want[i] != 0);
+        assert_eq!(got, want, "{backend}: SCC after s_absdiff_i32 case {i} got {got}, want {want}");
+    });
+}
+
+#[test]
 fn max_and_min_order_negative_zero_below_positive_zero() {
     let (pz, nz) = (0_u32, 0x8000_0000_u32);
     // Each case has a -0 and a +0 among its first two operands.
