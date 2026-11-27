@@ -8560,6 +8560,12 @@ impl<'a> Lower<'a> {
             "v_cvt_i16_f16",
             "v_cvt_norm_i16_f16",
             "v_cvt_norm_u16_f16",
+            "v_min3_i16",
+            "v_min3_u16",
+            "v_max3_i16",
+            "v_max3_u16",
+            "v_med3_i16",
+            "v_med3_u16",
         ];
         let all = [FLOAT1, FLOAT2, FLOAT3, INT];
         if !all.iter().any(|l| l.contains(&name))
@@ -8755,6 +8761,43 @@ impl<'a> Lower<'a> {
             if name.ends_with("_i16") {
                 a = sext(self, a);
                 b = sext(self, b);
+            }
+            if let Some(op) = name.strip_prefix("v_").and_then(|n| n.get(..4))
+                && matches!(op, "min3" | "max3" | "med3")
+            {
+                // RDNA2 ISA: min and max of the three as the 16-bit
+                // integers they are (sign-extended for _i16); med3 is the
+                // middle one, the same as max(min(a, b), min(max(a, b), c)).
+                let mut d = self.half_src(inst, 2)?;
+                if name.ends_with("_i16") {
+                    d = sext(self, d);
+                }
+                let (lt, gt) = if name.ends_with("_i16") {
+                    (pred::SLT, pred::SGT)
+                } else {
+                    (pred::IULT, pred::IUGT)
+                };
+                let pick = |l: &mut Self, p, x, y| {
+                    let t = l.s.m.cmp(c, p, x, y);
+                    l.s.m.select(c, t, x, y)
+                };
+                let r = match op {
+                    "min3" => {
+                        let t = pick(self, lt, a, b);
+                        pick(self, lt, t, d)
+                    }
+                    "max3" => {
+                        let t = pick(self, gt, a, b);
+                        pick(self, gt, t, d)
+                    }
+                    _ => {
+                        let lo = pick(self, lt, a, b);
+                        let hi = pick(self, gt, a, b);
+                        let t = pick(self, lt, hi, d);
+                        pick(self, gt, lo, t)
+                    }
+                };
+                return self.write_half(inst, r, guard);
             }
             let k15 = self.s.m.i32(15);
             match name {
@@ -11263,6 +11306,52 @@ mod tests {
                 vec![buffer],
             )
             .unwrap_or_else(|e| panic!("clamp {clamp}: {e}"));
+        }
+    }
+
+    /// `v_min3/v_max3/v_med3` on 16-bit integers (VOP3 0x352..=0x359)
+    /// decode and translate in a program that stores the result.
+    #[test]
+    fn int16_min3_max3_med3_translate() {
+        let program = |op: u32| {
+            let mut words = vec![
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0xFA00_0000,
+            ];
+            // v_mov_b32 v1..v4, s0..s3
+            words.extend((0..4u32).map(|i| 0x7E00_0200 | (i + 1) << 17 | i));
+            // op v0, v1, v2, v3
+            words.extend([0xD400_0000 | op << 16, 0x101 | 0x102 << 9 | 0x103 << 18]);
+            words.extend([0xE070_0000, 0x8002_0000, S_ENDPGM]); // buffer_store_dword v0
+            words
+        };
+        let buffer = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let constants = RootParam { sgprs: 4, ..root(RootType::Constants, 0, 0) };
+        for (op, name) in [
+            (0x352, "v_min3_i16"),
+            (0x353, "v_min3_u16"),
+            (0x355, "v_max3_i16"),
+            (0x356, "v_max3_u16"),
+            (0x358, "v_med3_i16"),
+            (0x359, "v_med3_u16"),
+        ] {
+            let code: Vec<u8> = program(op).iter().flat_map(|w| w.to_le_bytes()).collect();
+            let insts = crate::gfx10::decode(&code).unwrap();
+            let names: Vec<_> = insts.iter().map(|i| i.name()).collect();
+            assert!(names.contains(&Some(name)), "{names:?}");
+            let layout = vec![constants, root(RootType::Table, 4, 1)];
+            lower_with(&program(op), layout, vec![buffer])
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
         }
     }
 

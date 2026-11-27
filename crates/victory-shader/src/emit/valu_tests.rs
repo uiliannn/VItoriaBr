@@ -1113,6 +1113,32 @@ fn f16_omod_applies_before_clamp() {
 }
 
 #[test]
+fn v_min3_max3_med3_16bit_integer_forms_match_rdna2() {
+    // Each reads the low halves (the high halves 0x0001, 0x7777 and 0xFFFF
+    // must not count) and writes v0's low half, keeping its high half (0).
+    let inputs = [
+        [0x0001_8000u32, 0x7777_7FFF, 0xFFFF_0005, 0],
+        [0x0001_0003, 0x7777_0003, 0xFFFF_0001, 0],
+        [0x0001_FFFF, 0x7777_0000, 0xFFFF_0001, 0],
+    ];
+    for (op, name, want) in [
+        (0x352u16, "v_min3_i16", [0x8000u32, 0x0001, 0xFFFF]),
+        (0x353, "v_min3_u16", [0x0005, 0x0001, 0x0000]),
+        (0x355, "v_max3_i16", [0x7FFF, 0x0003, 0x0001]),
+        (0x356, "v_max3_u16", [0x8000, 0x0003, 0xFFFF]),
+        (0x358, "v_med3_i16", [0x0005, 0x0003, 0x0000]),
+        (0x359, "v_med3_u16", [0x7FFF, 0x0003, 0x0001]),
+    ] {
+        let [w0, w1] = vop3(op, 0, vgpr(1), vgpr(2), vgpr(3));
+        let shader = build_valu_cs(&[w0, w1]);
+        run_cases(&shader, &inputs, |backend, i, _, got| {
+            let want = want[i];
+            assert_eq!(got, want, "{backend}: {name} case {i} got {got:#010x}, want {want:#010x}");
+        });
+    }
+}
+
+#[test]
 fn cvt_16bit_int_from_f16_saturates_and_honors_modifiers() {
     // VOP3 v_cvt_u16_f16 = 0x1D2 (0x180 + VOP1 0x52)
     // VOP3 v_cvt_i16_f16 = 0x1D3 (0x180 + VOP1 0x53)
