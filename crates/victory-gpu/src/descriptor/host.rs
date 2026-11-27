@@ -596,6 +596,11 @@ impl TextureQueue {
         self.slots.remove(&index);
     }
 
+    /// Whether at least one queued slot is due at `frame`.
+    fn has_due(&self, frame: u64) -> bool {
+        self.slots.values().any(|w| w.due <= frame)
+    }
+
     /// Up to `max` slots due at `frame`, each with its write number, in
     /// the order to serve them:
     /// - first the ones looked at before (their memory was not mapped, or
@@ -1223,6 +1228,11 @@ impl HostHeap {
     /// The view-address table's buffer, for a list to hold.
     pub(crate) fn views_buffer(&self) -> Option<&ID3D12Resource> {
         self.views.as_ref().map(|s| &s.0)
+    }
+
+    /// Whether any slot in the queue of textures picked by index is due at `frame`.
+    pub(crate) fn texture_slots_has_due(&self, frame: u64) -> bool {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).has_due(frame)
     }
 
     /// Up to `max` title slots whose texture view is due at `frame`, each

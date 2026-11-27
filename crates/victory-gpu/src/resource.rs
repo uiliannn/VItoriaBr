@@ -1422,6 +1422,27 @@ pub(crate) fn host_made<'a>(
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
 }
 
+#[cfg(windows)]
+fn texture_budget_limit() -> Option<u64> {
+    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
+        mb.trim()
+            .parse::<u64>()
+            .ok()
+            .map(|mb| mb.min(u64::MAX >> 20) << 20)
+    })
+}
+
+/// Remaining bytes under `VICTORY_TEXTURE_BUDGET_MB`, if that cap is set.
+#[cfg(windows)]
+pub(crate) fn texture_budget_remaining() -> Option<u64> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let limit = texture_budget_limit()?;
+    let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
+    Some(limit.saturating_sub(filled))
+}
+
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
 /// up to `FLOOR` bytes of them, beyond that while the card's memory in use
@@ -1434,15 +1455,10 @@ pub(crate) fn room() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     const FLOOR: u64 = 2 << 30;
     const WITHOUT_BUDGET: u64 = 4 << 30;
-    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    let limit = *LIMIT.get_or_init(|| {
-        let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
-        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
-    });
     // (With the tiles of the copies made level by level, whose own bytes
     // count as none: `crate::tiles`.)
     let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
-    if let Some(limit) = limit {
+    if let Some(limit) = texture_budget_limit() {
         return filled < limit;
     }
     if filled < FLOOR {
