@@ -540,6 +540,22 @@ fn v_med3_f16_matches_rdna2_with_nan() {
 /// `v_cmp_lg_*` is "less or greater": ordered and not equal, so false when
 /// either operand is a NaN (RDNA2 ISA; the same on gfx1036 hardware).
 #[test]
+fn scalar_packs_take_the_halves_their_names_say() {
+    // s_pack_xy_b32_b16 s12, s0, s1; v_mov_b32 v0, s12.
+    let cases = [[0x1111_2222u32, 0x3333_4444, 0, 0], [0xABCD_0001, 0x0002_EF01, 0, 0]];
+    for (op, name, want) in [
+        (0x32u8, "s_pack_ll_b32_b16", [0x4444_2222u32, 0xEF01_0001]),
+        (0x33, "s_pack_lh_b32_b16", [0x3333_2222, 0x0002_0001]),
+        (0x34, "s_pack_hh_b32_b16", [0x3333_1111, 0x0002_ABCD]),
+    ] {
+        let shader = build_valu_cs(&[sop2(op, 12, 0, 1), vop1(0x001, 0, sgpr(12))]);
+        run_cases(&shader, &cases, |backend, i, _, got| {
+            assert_eq!(got, want[i], "{backend}: {name} case {i} got {got:#010x}, want {:#010x}", want[i]);
+        });
+    }
+}
+
+#[test]
 fn v_cmp_lg_is_false_for_nan() {
     // v_cmp_lg_{f32,f16}_e64 s20, v1, v2 (VOPC 0x005 / 0x0cd in VOP3);
     // v_cndmask_b32_e64 v0, 0, 1, s20 (VOP3 0x101)
