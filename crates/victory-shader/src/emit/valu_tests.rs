@@ -1228,6 +1228,32 @@ fn lds_min_max_ref(old: u32, data: u32, max: bool) -> u32 {
 }
 
 #[test]
+fn v_cvt_pk_u16_u32_and_i16_i32_saturate_each_half() {
+    for (op, name, cases) in [
+        (0x36Au16, "v_cvt_pk_u16_u32", [
+            ([0x1234u32, 0xFFFF], 0xFFFF_1234u32),
+            ([0x1_0000, 5], 0x0005_FFFF),
+            ([0xFFFF_FFFF, 0], 0x0000_FFFF),
+            ([0, 0x8000_0000], 0xFFFF_0000),
+        ]),
+        (0x36B, "v_cvt_pk_i16_i32", [
+            ([0xFFFF_FFFF, 0x7FFF], 0x7FFF_FFFF),
+            ([0x8000, 0xFFFF_8000], 0x8000_7FFF),
+            ([0x8000_0000, 0x7FFF_FFFF], 0x7FFF_8000),
+            ([5, 0xFFFF_FFF9], 0xFFF9_0005),
+        ]),
+    ] {
+        let [w0, w1] = vop3(op, 0, vgpr(1), vgpr(2), 0);
+        let shader = build_valu_cs(&[w0, w1]);
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| [c.0[0], c.0[1], 0, 0]).collect();
+        run_cases(&shader, &inputs, |backend, i, _, got| {
+            let want = cases[i].1;
+            assert_eq!(got, want, "{backend}: {name} case {i} got {got:#010x}, want {want:#010x}");
+        });
+    }
+}
+
+#[test]
 fn ds_min_max_f32_order_floats_and_return_the_old_value() {
     let values = [
         0.0f32,

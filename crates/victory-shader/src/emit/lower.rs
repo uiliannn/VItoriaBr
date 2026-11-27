@@ -9142,6 +9142,34 @@ impl<'a> Lower<'a> {
                 let hi = self.s.m.select(c, none, zero, hi);
                 self.s.m.bin(c, Bin::Or, lo, hi)
             }
+            "v_cvt_pk_u16_u32" | "v_cvt_pk_i16_i32" => {
+                // D.lo = S0, D.hi = S1, each converted to 16 bits (AMD's
+                // RDNA2 ISA), saturating: Mesa's ACO emits these for NIR's
+                // pack_uint_2x16 / pack_sint_2x16 ("clamp is applied"), and
+                // v_cvt_pk_i16_i32 to saturate an ldexp exponent to i16.
+                let signed = name == "v_cvt_pk_i16_i32";
+                let (lo_k, hi_k) = (k(self, 0xFFFF_8000), k(self, 0x7FFF));
+                let max_u = k(self, 0xFFFF);
+                let half = |l: &mut Self, x: V| {
+                    let pick = |l: &mut Self, p, x, limit| {
+                        let out = l.s.m.cmp(c, p, x, limit);
+                        l.s.m.select(c, out, limit, x)
+                    };
+                    let x = if signed {
+                        let x = pick(l, pred::SLT, x, lo_k);
+                        pick(l, pred::SGT, x, hi_k)
+                    } else {
+                        pick(l, pred::IUGT, x, max_u)
+                    };
+                    l.s.m.bin(c, Bin::And, x, max_u)
+                };
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let lo = half(self, a);
+                let hi = half(self, b);
+                let k16 = k(self, 16);
+                let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
+                self.s.m.bin(c, Bin::Or, lo, hi)
+            }
             "v_bfrev_b32" => {
                 let a = s(self, 0)?;
                 self.s
@@ -11533,6 +11561,45 @@ mod tests {
             container.part(crate::FourCC::SFI0).unwrap();
 
         u64::from_le_bytes(features.data.try_into().unwrap())
+    }
+
+    /// `v_cvt_pk_u16_u32` and `v_cvt_pk_i16_i32` decode and translate in a
+    /// program that stores the result.
+    #[test]
+    fn saturating_16_bit_packs_translate() {
+        let program = |op: u32| {
+            let mut words = vec![
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0xFA00_0000,
+            ];
+            // v_mov_b32 v1..v4, s0..s3
+            words.extend((0..4u32).map(|i| 0x7E00_0200 | (i + 1) << 17 | i));
+            // op v0, v1, v2
+            words.extend([0xD400_0000 | op << 16, 0x101 | 0x102 << 9]);
+            words.extend([0xE070_0000, 0x8002_0000, S_ENDPGM]); // buffer_store_dword v0
+            words
+        };
+        let buffer = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let constants = RootParam { sgprs: 4, ..root(RootType::Constants, 0, 0) };
+        for (op, name) in [(0x36A, "v_cvt_pk_u16_u32"), (0x36B, "v_cvt_pk_i16_i32")] {
+            let code: Vec<u8> = program(op).iter().flat_map(|w| w.to_le_bytes()).collect();
+            let insts = crate::gfx10::decode(&code).unwrap();
+            let names: Vec<_> = insts.iter().map(|i| i.name()).collect();
+            assert!(names.contains(&Some(name)), "{names:?}");
+            let layout = vec![constants, root(RootType::Table, 4, 1)];
+            lower_with(&program(op), layout, vec![buffer])
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
     }
 
     #[test]
