@@ -762,6 +762,74 @@ mod tests {
         );
     }
 
+    /// 16-bit derivatives (`_g16`) pack two to a dword, as `a16` packs
+    /// them, so the address is shorter than the 32-bit form's; and the
+    /// `cd_g16` forms and `image_gather4h` have names. Words and text from
+    /// `llvm-mc -triple=amdgcn -mcpu=gfx1030 --disassemble`.
+    #[test]
+    fn g16_derivatives_pack_in_pairs() {
+        for (words, text) in [
+            (
+                [0xF088_0F09, 0x0040_0000],
+                "image_sample_d_g16 v[0:3], v[0:3], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            ),
+            (
+                [0xF088_0F11, 0x0040_0000],
+                "image_sample_d_g16 v[0:3], v[0:6], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_3D",
+            ),
+            (
+                [0xF088_0F19, 0x0040_0000],
+                "image_sample_d_g16 v[0:3], v[0:4], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_CUBE",
+            ),
+            (
+                [0xF0AC_0F09, 0x0040_0000],
+                "image_sample_c_d_cl_g16 v[0:3], v[0:5], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            ),
+            (
+                [0xF0E8_0F21, 0x0040_0000],
+                "image_sample_c_d_o_g16 v[0:3], v[0:5], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_1D_ARRAY",
+            ),
+            (
+                [0xF1A0_0F09, 0x0040_0000],
+                "image_sample_cd_g16 v[0:3], v[0:3], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            ),
+            (
+                [0xF1A4_0F09, 0x0040_0000],
+                "image_sample_cd_cl_g16 v[0:3], v[0:4], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            ),
+            (
+                [0xF1A8_0F11, 0x0040_0000],
+                "image_sample_c_cd_g16 v[0:3], v[0:7], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_3D",
+            ),
+            (
+                [0xF1AC_0F09, 0x0040_0000],
+                "image_sample_c_cd_cl_g16 v[0:3], v[0:5], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            ),
+            (
+                [0xF1B0_0F09, 0x0040_0000],
+                "image_sample_cd_o_g16 v[0:3], v[0:4], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            ),
+            (
+                [0xF1B4_0F29, 0x0040_0000],
+                "image_sample_cd_cl_o_g16 v[0:3], v[0:6], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY",
+            ),
+            (
+                [0xF1B8_0F09, 0x0040_0000],
+                "image_sample_c_cd_o_g16 v[0:3], v[0:5], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            ),
+            (
+                [0xF1BC_0F09, 0x0040_0000],
+                "image_sample_c_cd_cl_o_g16 v[0:3], v[0:6], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            ),
+            (
+                [0xF184_0208, 0x0040_0000],
+                "image_gather4h v[0:3], v[0:1], s[0:7], s[8:11] dmask:0x2 dim:SQ_RSRC_IMG_2D",
+            ),
+        ] {
+            assert_eq!(one(&words, false), text, "{words:08x?}");
+        }
+    }
+
     #[test]
     fn image_d16_data_is_packed() {
         // Three f16 channels occupy two VGPRs; NSA lists the addresses.

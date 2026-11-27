@@ -792,6 +792,8 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
         _ => {}
     }
     let (mut whole, mut derivs, mut packed): (u8, u8, u8) = (0, 0, coords);
+    // `_g16`: 16-bit derivatives, packed in pairs like `a16` packs them.
+    let mut g16 = a16;
     if let Some(rest) = name
         .strip_prefix("image_sample")
         .or_else(|| name.strip_prefix("image_gather4"))
@@ -801,14 +803,16 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
                 "o" | "b" | "c" => whole += 1,
                 "d" | "cd" => derivs = grads,
                 "l" | "cl" => packed += 1,
+                "g16" => g16 = true,
                 _ => {}
             }
         }
     } else if name.contains("_mip") {
         packed += 1;
     }
+    let derivs = if g16 { derivs.div_ceil(2) } else { derivs };
     if a16 {
-        whole + 2 * derivs.div_ceil(2) + packed.div_ceil(2)
+        whole + 2 * derivs + packed.div_ceil(2)
     } else {
         whole + 2 * derivs + packed
     }

@@ -1048,6 +1048,24 @@ mod tests {
         }
     }
 
+    /// The forms with 16-bit derivatives (`_g16`, `cd_g16`) and
+    /// `image_gather4h` decode but have no lowering yet: refused as
+    /// unsupported, never read as another form.
+    #[test]
+    fn g16_and_gather4h_forms_are_refused() {
+        for opcode in [
+            0x0A2, 0x0E8, 0x0E9, 0x0EA, 0x0EB, 0x0EC, 0x0ED, 0x0EE, 0x0EF, 0x061,
+        ] {
+            let dmask = if opcode == 0x061 { 0x1 } else { 0xF };
+            let lowered = lower_mimg_sample(true, opcode, 1, dmask, false, 0, None);
+            assert!(
+                matches!(lowered, Err(crate::ShaderError::Unsupported { .. })),
+                "{opcode:#x}: {:?}",
+                lowered.map(|_| ())
+            );
+        }
+    }
+
     #[test]
     fn mimg_offset_variants_read_clamp_bias_and_explicit_lod_operands() {
         const OFF_2D: u32 = 0x0000_3E01;

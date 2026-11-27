@@ -1152,6 +1152,7 @@ pub(super) const MIMG: &[(u16, &str)] = &[
     (0x05e, "image_gather4_c_b_cl_o"),
     (0x05f, "image_gather4_c_lz_o"),
     (0x060, "image_get_lod"),
+    (0x061, "image_gather4h"),
     (0x068, "image_sample_cd"),
     (0x069, "image_sample_cd_cl"),
     (0x06a, "image_sample_c_cd"),
@@ -1171,6 +1172,14 @@ pub(super) const MIMG: &[(u16, &str)] = &[
     (0x0bb, "image_sample_c_d_cl_o_g16"),
     (0x0e6, "image_bvh_intersect_ray"),
     (0x0e7, "image_bvh64_intersect_ray"),
+    (0x0e8, "image_sample_cd_g16"),
+    (0x0e9, "image_sample_cd_cl_g16"),
+    (0x0ea, "image_sample_c_cd_g16"),
+    (0x0eb, "image_sample_c_cd_cl_g16"),
+    (0x0ec, "image_sample_cd_o_g16"),
+    (0x0ed, "image_sample_cd_cl_o_g16"),
+    (0x0ee, "image_sample_c_cd_o_g16"),
+    (0x0ef, "image_sample_c_cd_cl_o_g16"),
 ];
 
 pub(super) const FLAT: &[(u16, &str)] = &[
