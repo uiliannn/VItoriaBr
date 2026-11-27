@@ -504,7 +504,12 @@ fn valu(name: &str, v: &Valu, encoding: Encoding) -> String {
     let mix = name.starts_with("v_fma_mix");
     let src = |i: usize| {
         let o = v.src[i];
-        let mut s = o.to_string();
+        let mut s = match (name, i, o) {
+            ("v_interp_mov_f32", 1, Operand::Const(p)) => ["p10", "p20", "p0"]
+                .get(usize::from(p))
+                .map_or("p?".into(), |p| p.to_string()),
+            _ => o.to_string(),
+        };
         if let Some(sdwa) = v.sdwa
             && bit(sdwa.sext, i)
         {
@@ -760,6 +765,44 @@ mod tests {
             one(&[0xF800_1C0F, 0x0000_0302], true),
             "exp mrt0, v2, v2, v3, v3 done compr vm"
         );
+    }
+
+    /// The VOP3 interpolation forms: the first source is an attribute and
+    /// its channel, so attr63.w (0xFF) is no literal and the instruction is
+    /// two dwords; and VOP3 0x200-0x202 are the 64-bit-encoded
+    /// v_interp_p1_f32, v_interp_p2_f32 and v_interp_mov_f32. Words from
+    /// `llvm-mc -triple=amdgcn -mcpu=gfx1030`, which prints the same
+    /// operands (with an `_e64` suffix on the first three).
+    #[test]
+    fn vop3_interpolation_attributes_are_not_literals() {
+        for (words, text) in [
+            (
+                [0xD600_0000, 0x0202_02DF],
+                "v_interp_p1_f32 v0, v1, attr31.w",
+            ),
+            (
+                [0xD601_0000, 0x0202_02DF],
+                "v_interp_p2_f32 v0, v1, attr31.w",
+            ),
+            (
+                [0xD602_0000, 0x0200_04DF],
+                "v_interp_mov_f32 v0, p0, attr31.w",
+            ),
+            (
+                [0xD742_0000, 0x0202_02FF],
+                "v_interp_p1ll_f16 v0, v1, attr63.w",
+            ),
+            (
+                [0xD743_0000, 0x040A_02FF],
+                "v_interp_p1lv_f16 v0, v1, attr63.w, v2",
+            ),
+            (
+                [0xD75A_0000, 0x040A_02FF],
+                "v_interp_p2_f16 v0, v1, attr63.w, v2",
+            ),
+        ] {
+            assert_eq!(one(&words, false), text, "{words:08x?}");
+        }
     }
 
     #[test]

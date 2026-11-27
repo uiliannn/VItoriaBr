@@ -755,6 +755,22 @@ mod tests {
         assert!(raise(&other, &pixel(vec![TEXCOORD], 2)).is_err());
     }
 
+    /// The VOP3 (64-bit) encodings of v_interp_p1_f32 and v_interp_p2_f32
+    /// decode, but only the VINTRP pair is understood: they are refused.
+    #[test]
+    fn vop3_encoded_f32_interpolation_is_refused() {
+        let p = program(&[
+            0xD600_0002, // v_interp_p1_f32_e64 v2, v0, attr0.x
+            0x0202_0000,
+            0xD601_0002, // v_interp_p2_f32_e64 v2, v1, attr0.x
+            0x0202_0200,
+            S_ENDPGM,
+        ]);
+        let names: Vec<_> = p.blocks[0].insts.iter().map(|i| i.name()).collect();
+        assert_eq!(names, ["v_interp_p1_f32", "v_interp_p2_f32", "s_endpgm"]);
+        assert!(raise(&p, &pixel(vec![TEXCOORD], 2)).is_err());
+    }
+
     #[test]
     fn computed_barycentrics_evaluate_each_half() {
         // i scaled before the first half: both halves stand on their own.

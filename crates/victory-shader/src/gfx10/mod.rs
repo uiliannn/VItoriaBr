@@ -251,10 +251,23 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
     } else {
         let vop3 =
             |w1: u32| 2 + usize::from([w1, w1 >> 9, w1 >> 18].iter().any(|s| s & 0x1FF == 0xFF));
+        // The interpolation forms' first source is an attribute and its
+        // channel (attr63.w is 0xFF), never a literal.
+        let interp =
+            |w1: u32| 2 + usize::from([w1 >> 9, w1 >> 18].iter().any(|s| s & 0x1FF == 0xFF));
         match w >> 26 {
             0x32 => (Encoding::Vintrp, (w >> 16) & 0x3, 1),
             0x33 => (Encoding::Vop3p, (w >> 16) & 0x7F, vop3(word(1)?)),
-            0x35 => (Encoding::Vop3, (w >> 16) & 0x3FF, vop3(word(1)?)),
+            0x35 => {
+                let op = (w >> 16) & 0x3FF;
+                let interp_op = matches!(op, 0x200..=0x202 | 0x342 | 0x343 | 0x35A);
+                let len = if interp_op {
+                    interp(word(1)?)
+                } else {
+                    vop3(word(1)?)
+                };
+                (Encoding::Vop3, op, len)
+            }
             0x36 => (Encoding::Ds, (w >> 18) & 0xFF, 2),
             0x37 => {
                 let encoding = match (w >> 14) & 3 {
