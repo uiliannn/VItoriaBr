@@ -269,6 +269,42 @@ fn run_cases_on(
     assert!(ran > 0, "no SM 6.6 device available ({devices:?})");
 }
 
+#[test]
+fn f64_add_mul_fma_min_max_match_ieee() {
+    // op v[5:6], v[1:2], v[3:4] (v_fma_f64: + v[1:2]); then v_mov_b32 v0,
+    // v5 (low dword) or v6 (high dword).
+    let d = |x: f64| [x.to_bits() as u32, (x.to_bits() >> 32) as u32];
+    let pairs = [(1.5f64, 2.25f64), (0.1, 0.2), (-0.0, 0.0), (1e300, 1e10), (f64::NAN, 3.0), (-7.0, f64::INFINITY)];
+    type Op = fn(f64, f64) -> f64;
+    let ops: [(u32, &str, Op); 5] = [
+        (0x164, "v_add_f64", |a, b| a + b),
+        (0x165, "v_mul_f64", |a, b| a * b),
+        (0x166, "v_min_f64", |a, b| if a == 0.0 && b == 0.0 { if a.is_sign_negative() || b.is_sign_negative() { -0.0 } else { 0.0 } } else { a.min(b) }),
+        (0x167, "v_max_f64", |a, b| if a == 0.0 && b == 0.0 { if a.is_sign_negative() && b.is_sign_negative() { -0.0 } else { 0.0 } } else { a.max(b) }),
+        (0x14C, "v_fma_f64", |a, b| a.mul_add(b, a)),
+    ];
+    let inputs: Vec<[u32; 4]> = pairs.iter().map(|&(a, b)| { let (a, b) = (d(a), d(b)); [a[0], a[1], b[0], b[1]] }).collect();
+    for (op, name, f) in ops {
+        let w = [0x35 << 26 | op << 16 | 5, 0x101 | 0x103 << 9 | 0x101 << 18];
+        for (h, src) in [(0, 5u8), (1, 6)] {
+            let shader = build_valu_cs(&[w[0], w[1], vop1(0x001, 0, vgpr(src))]);
+            run_cases(&shader, &inputs, |backend, i, _, got| {
+                let (a, b) = pairs[i];
+                let r = f(a, b);
+                if r.is_nan() {
+                    // Any NaN: the high dword's exponent all ones, some mantissa bit set.
+                    if h == 1 {
+                        assert_eq!(got & 0x7FF0_0000, 0x7FF0_0000, "{backend}: {name}({a}, {b}) high dword {got:#010x}, want a NaN");
+                    }
+                    return;
+                }
+                let want = d(r)[h];
+                assert_eq!(got, want, "{backend}: {name}({a}, {b}) dword {h} = {got:#010x}, want {want:#010x}");
+            });
+        }
+    }
+}
+
 fn is_f16_nan(bits: u16) -> bool {
     (bits & 0x7FFF) > 0x7C00
 }

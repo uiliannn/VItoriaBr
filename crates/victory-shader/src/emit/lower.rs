@@ -7447,6 +7447,65 @@ impl<'a> Lower<'a> {
                 }
                 Ok(())
             }
+            "v_add_f64" | "v_mul_f64" | "v_fma_f64" | "v_min_f64" | "v_max_f64" => {
+                // IEEE binary64 arithmetic (AMD's RDNA2 ISA), in the host's
+                // doubles: the operand pairs (with abs/neg) joined by
+                // MakeDouble, the result split back. min/max are DXIL's
+                // DMin/DMax (the non-NaN operand of one NaN), with -0 below
+                // +0 as `max_min` orders f32 zeros.
+                if v.clamp || v.omod != 0 {
+                    return Err("f64 output modifiers");
+                }
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("a 64-bit result");
+                };
+                self.s.flags |= flags::DOUBLES;
+                let f64t = self.s.m.double();
+                let i32t = self.s.t.i32;
+                let sources = if name == "v_fma_f64" { 3 } else { 2 };
+                let mut pairs = Vec::new();
+                let mut d = Vec::new();
+                for k in 0..sources {
+                    let (lo, hi) = self.f64_pair(inst, k)?;
+                    pairs.push((lo, hi));
+                    d.push(self.s.op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[lo, hi]));
+                }
+                let r = match name {
+                    "v_add_f64" => self.s.m.bin(c, Bin::Add, d[0], d[1]),
+                    "v_mul_f64" => self.s.m.bin(c, Bin::Mul, d[0], d[1]),
+                    "v_fma_f64" => {
+                        self.s.op(c, "tertiary.f64", Attr::ReadNone, f64t, 47, &[d[0], d[1], d[2]])
+                    }
+                    _ => {
+                        let max = name == "v_max_f64";
+                        let op = if max { 35 } else { 36 };
+                        self.s.op(c, "binary.f64", Attr::ReadNone, f64t, op, &[d[0], d[1]])
+                    }
+                };
+                let split_ty = self.s.m.named_struct("dx.types.splitdouble", vec![i32t, i32t]);
+                let split = self.s.op(c, "splitDouble.f64", Attr::ReadNone, split_ty, 102, &[r]);
+                let mut lo = self.s.m.extract(c, split, 0);
+                let mut hi = self.s.m.extract(c, split, 1);
+                if matches!(name, "v_min_f64" | "v_max_f64") {
+                    // Of two zeros: +0 unless both are -0 (max), -0 unless
+                    // neither is (min).
+                    let [(alo, ahi), (blo, bhi)] = [pairs[0], pairs[1]];
+                    let low = self.s.m.bin(c, Bin::Or, alo, blo);
+                    let high = self.s.m.bin(c, Bin::Or, ahi, bhi);
+                    let magnitude = self.s.m.i32(0x7FFF_FFFF);
+                    let high = self.s.m.bin(c, Bin::And, high, magnitude);
+                    let both = self.s.m.bin(c, Bin::Or, low, high);
+                    let z = self.s.m.i32(0);
+                    let zeros = self.s.m.cmp(c, pred::EQ, both, z);
+                    let op = if name == "v_max_f64" { Bin::And } else { Bin::Or };
+                    let sign = self.s.m.bin(c, op, ahi, bhi);
+                    hi = self.s.m.select(c, zeros, sign, hi);
+                    lo = self.s.m.select(c, zeros, z, lo);
+                }
+                self.write(inst, Reg::V(reg), lo, guard);
+                self.write(inst, Reg::V(reg + 1), hi, guard);
+                Ok(())
+            }
             "v_ffbh_u32" | "v_ffbh_i32" => {
                 // Counted from the top bit, -1 when none (DXIL's too).
                 let a = s(self, 0)?;
@@ -11641,6 +11700,51 @@ mod tests {
             slot: 0,
         });
         (layout, used)
+    }
+
+    /// `v_add_f64`, `v_mul_f64`, `v_min_f64`, `v_max_f64` and `v_fma_f64` decode and
+    /// translate in a program that stores the result (`v[0:1]` from
+    /// `v[1:2]` and `v[3:4]`).
+    #[test]
+    fn f64_arithmetic_translates() {
+        let program = |body: [u32; 2]| {
+            let mut words = vec![
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0xFA00_0000,
+            ];
+            // v_mov_b32 v1..v4, s0..s3
+            words.extend((0..4u32).map(|i| 0x7E00_0200 | (i + 1) << 17 | i));
+            words.extend(body);
+            words.extend([0xE070_0000, 0x8002_0000, S_ENDPGM]); // buffer_store_dword v0
+            words
+        };
+        let buffer = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let constants = RootParam { sgprs: 4, ..root(RootType::Constants, 0, 0) };
+        for (body, name) in [
+            ([0xD400_0000 | 0x164 << 16, 0x101 | 0x103 << 9], "v_add_f64"),
+            ([0xD400_0000 | 0x165 << 16, 0x101 | 0x103 << 9], "v_mul_f64"),
+            ([0xD400_0000 | 0x166 << 16, 0x101 | 0x103 << 9], "v_min_f64"),
+            ([0xD400_0000 | 0x167 << 16, 0x101 | 0x103 << 9], "v_max_f64"),
+            ([0xD400_0000 | 0x14C << 16, 0x101 | 0x103 << 9 | 0x101 << 18], "v_fma_f64"),
+        ] {
+            let code: Vec<u8> = program(body).iter().flat_map(|w| w.to_le_bytes()).collect();
+            let insts = crate::gfx10::decode(&code).unwrap();
+            let names: Vec<_> = insts.iter().map(|i| i.name()).collect();
+            assert!(names.contains(&Some(name)), "{names:?}");
+            let layout = vec![constants, root(RootType::Table, 4, 1)];
+            lower_with(&program(body), layout, vec![buffer])
+                .unwrap_or_else(|e| panic!("{name} {body:08x?}: {e}"));
+        }
     }
 
     #[test]
