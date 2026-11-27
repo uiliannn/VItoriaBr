@@ -46,8 +46,9 @@
 //! Only for a texture the title places in memory and fills, two-dimensional,
 //! one layer, more than one level, of [`floor`] bytes or more, whose memory
 //! is not all its own when the host copy is made (`resource.rs` `hosted`);
-//! every other texture is made as before. Off unless
-//! `VICTORY_LEVELS_ON_DEMAND=1`.
+//! every other texture is made as before. Enabled by default on adapters
+//! supporting tiled resources tier 2; opt out with
+//! `VICTORY_LEVELS_ON_DEMAND=0`.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -71,14 +72,13 @@ const HEAP_TILES: u32 = 1024;
 /// no heap could be had); uploads recorded again for such a level.
 pub(crate) static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
-/// Whether textures are made this way: the switch
-/// (`VICTORY_LEVELS_ON_DEMAND=1`; off by default), and a card that reads
+/// Whether textures are made this way: on by default for a card that reads
 /// zeros from, and drops writes to, levels without memory (tiled resources
-/// tier 2).
+/// tier 2), unless disabled via `VICTORY_LEVELS_ON_DEMAND=0`.
 pub(crate) fn wanted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        if !std::env::var_os("VICTORY_LEVELS_ON_DEMAND").is_some_and(|v| v == "1") {
+        if std::env::var_os("VICTORY_LEVELS_ON_DEMAND").is_some_and(|v| v == "0") {
             return false;
         }
         let Some(host) = host() else {
@@ -99,7 +99,7 @@ pub(crate) fn wanted() -> bool {
             tier,
             on,
             floor_kb = floor() >> 10,
-            "host copies of title textures take the card's memory level by level (VICTORY_LEVELS_ON_DEMAND=1)"
+            "host copies of title textures take the card's memory level by level (VICTORY_LEVELS_ON_DEMAND=0 disables)"
         );
         on
     })
