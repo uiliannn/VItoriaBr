@@ -989,6 +989,37 @@ fn signed_64_bit_operands_sign_extend_their_literal() {
 }
 
 #[test]
+fn signed_multiplies_match_rdna2() {
+    // v_mul_lo_i32 v0, v1, v2: the low 32 bits of the signed product.
+    let [w0, w1] = vop3(0x16B, 0, vgpr(1), vgpr(2), 0);
+    let shader = build_valu_cs(&[w0, w1]);
+    let cases = [([0xFFFF_FFFDu32, 7], 0xFFFF_FFEBu32), ([0x1_0001, 0x1_0001], 0x0002_0001)];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| [c.0[0], c.0[1], 0, 0]).collect();
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        let want = cases[i].1;
+        assert_eq!(got, want, "{backend}: v_mul_lo_i32 case {i} got {got:#010x}, want {want:#010x}");
+    });
+
+    // v_mad_i64_i32 v[5:6], null, v1, v2, v[3:4] (VOP3B 0x177), then
+    // v_mov_b32 v0, v5 (the low dword) or v6 (the high dword).
+    let mad = [0x35 << 26 | 0x177 << 16 | 125 << 8 | 5, 0x101 | 0x102 << 9 | 0x103 << 18];
+    let cases: [([u32; 4], u64); 4] = [
+        ([0xFFFF_FFFF, 5, 0, 0], (-5i64) as u64),
+        ([0x8000_0000, 0x8000_0000, 0, 0], 1 << 62),
+        ([0x7FFF_FFFF, 0xFFFF_FFFF, 10, 0], (-2_147_483_637i64) as u64),
+        ([3, 4, 0xFFFF_FFFF, 0], 0x1_0000_000B),
+    ];
+    for (half, src) in [(0, 5u8), (1, 6)] {
+        let shader = build_valu_cs(&[mad[0], mad[1], vop1(0x001, 0, vgpr(src))]);
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+        run_cases(&shader, &inputs, |backend, i, _, got| {
+            let want = (cases[i].1 >> (32 * half)) as u32;
+            assert_eq!(got, want, "{backend}: v_mad_i64_i32 case {i} dword {half} got {got:#010x}, want {want:#010x}");
+        });
+    }
+}
+
+#[test]
 fn bfe_signed_and_unsigned_match_rdna2() {
     // v_bfe_i32 v0, v1, v2, v3 (VOP3 opcode 0x149)
     let v_signed = build_valu_cs(&vop3(0x149, 0, vgpr(1), vgpr(2), vgpr(3)));

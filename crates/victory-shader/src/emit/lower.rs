@@ -7431,6 +7431,36 @@ impl<'a> Lower<'a> {
                 }
                 Ok(())
             }
+            "v_mad_i64_i32" => {
+                // RDNA2 ISA: D.i64 = S0.i32 * S1.i32 + S2.i64, the product
+                // sign-extended; S2 is a signed 64-bit operand, so a 32-bit
+                // literal sign-extends (as #41 does for the _i64 forms).
+                // The scalar carry-out is left unwritten: anything that
+                // reads it fails to translate rather than read a guess.
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let i64t = self.s.m.int(64);
+                let x = match v.src.get(2) {
+                    Some(&Operand::Literal(l)) => self.s.m.int_const(i64t, i64::from(l as i32)),
+                    _ => self.src64(inst, 2)?,
+                };
+                self.s.flags |= flags::INT64;
+                let a = self.s.m.cast(c, Cast::SExt, a, i64t);
+                let b = self.s.m.cast(c, Cast::SExt, b, i64t);
+                let product = self.s.m.bin(c, Bin::Mul, a, b);
+                let r = self.s.m.bin(c, Bin::Add, product, x);
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("a 64-bit result");
+                };
+                let (lo, hi) = self.split64(r);
+                self.write(inst, Reg::V(reg), lo, guard);
+                self.write(inst, Reg::V(reg + 1), hi, guard);
+                for &(_, w) in &inst.writes {
+                    self.vals
+                        .entry(w)
+                        .or_insert(Val::Missing("the carry-out of v_mad_i64_i32"));
+                }
+                Ok(())
+            }
             "v_swap_b32" => {
                 let (
                     Some(&Operand::Vector { reg: sreg, .. }),
@@ -9011,7 +9041,8 @@ impl<'a> Lower<'a> {
         };
         Ok(match name {
             "v_and_b32" | "v_or_b32" | "v_xor_b32" | "v_add_nc_u32" | "v_sub_nc_u32"
-            | "v_subrev_nc_u32" | "v_mul_lo_u32" => {
+            | "v_subrev_nc_u32" | "v_mul_lo_u32" | "v_mul_lo_i32" => {
+                // (v_mul_lo_i32's low 32 bits are v_mul_lo_u32's.)
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
                 let (op, a, b) = match name {
                     "v_and_b32" => (Bin::And, a, b),
@@ -11434,6 +11465,62 @@ mod tests {
         // host to invalidate its cached view of a buffer.
         assert!(lowers(&[0xE1C4_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl0_inv");
         assert!(lowers(&[0xE1C8_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl1_inv");
+    }
+
+    /// `v_mul_lo_i32` and `v_mad_i64_i32` (with no carry-out, or one that
+    /// is never read) decode and translate in a program that stores the
+    /// result; reading `v_mad_i64_i32`'s carry-out is refused.
+    #[test]
+    fn signed_multiplies_translate() {
+        let program = |body: &[u32]| {
+            let mut words = vec![
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0xFA00_0000,
+            ];
+            // v_mov_b32 v1..v4, s0..s3
+            words.extend((0..4u32).map(|i| 0x7E00_0200 | (i + 1) << 17 | i));
+            words.extend(body);
+            words.extend([0xE070_0000, 0x8002_0000, S_ENDPGM]); // buffer_store_dword v0
+            words
+        };
+        let buffer = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let constants = RootParam { sgprs: 4, ..root(RootType::Constants, 0, 0) };
+        let lowered = |body: &[u32]| {
+            let layout = vec![constants, root(RootType::Table, 4, 1)];
+            lower_with(&program(body), layout, vec![buffer])
+        };
+        // v_mad_i64_i32 v[0:1], sdst, v1, v2, v[3:4]
+        let mad = |sdst: u32| [0xD400_0000 | 0x177 << 16 | sdst << 8, 0x101 | 0x102 << 9 | 0x103 << 18];
+        let mul = [0xD400_0000 | 0x16B << 16, 0x101 | 0x102 << 9];
+        for (body, name) in [
+            (&mul[..], "v_mul_lo_i32"),
+            (&mad(125)[..], "v_mad_i64_i32"), // sdst null
+            (&mad(12)[..], "v_mad_i64_i32"),  // s[12:13], never read
+        ] {
+            let code: Vec<u8> = program(body).iter().flat_map(|w| w.to_le_bytes()).collect();
+            let insts = crate::gfx10::decode(&code).unwrap();
+            let names: Vec<_> = insts.iter().map(|i| i.name()).collect();
+            assert!(names.contains(&Some(name)), "{names:?}");
+            lowered(body).unwrap_or_else(|e| panic!("{name} {body:08x?}: {e}"));
+        }
+        // v_cndmask_b32 v0, v1, v2, s[12:13] reads the carry-out.
+        let [m0, m1] = mad(12);
+        let read = [m0, m1, 0xD501_0000, 0x101 | 0x102 << 9 | 12 << 18];
+        let e = lowered(&read).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(e.contains("carry"), "reading v_mad_i64_i32's carry-out: {e:?}");
+        // The same read of v_mad_u64_u32's carry-out (VOP3B 0x176) translates.
+        let unsigned = [m0 & !(0x3FF << 16) | 0x176 << 16, m1, read[2], read[3]];
+        lowered(&unsigned).unwrap_or_else(|e| panic!("v_mad_u64_u32's carry-out: {e}"));
     }
 
     #[test]
