@@ -455,12 +455,21 @@ fn card_limits() -> (u64, u64) {
         let mb = |name: &str, default: u64| {
             std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
         };
+        let least = card_min_kib(std::env::var("VICTORY_CARD_BUFFERS_MIN_KB").ok().as_deref())
+            .unwrap_or_else(|| mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20));
         // From 1 MiB up and 1,024 MB in all by default (it was 16 and 512):
         // the shader writes of the smaller buffers are then found by the
         // card's hashes too, and with that the first room's walls were
         // drawn in every run.
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 1024))
+        (least, mb("VICTORY_CARD_BUFFERS_MB", 1024))
     })
+}
+
+fn card_min_kib(value: Option<&str>) -> Option<u64> {
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&kib| kib > 0)
+        .map(|kib| kib << 10)
 }
 
 /// Bytes alive of copies' card sides, and of their "before" twins.
@@ -843,7 +852,15 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
 
 #[cfg(test)]
 mod card_tests {
-    use super::{CardSpan, PIECE, card_piece_of, card_span_of, joined, joined_piece_runs};
+    use super::{CardSpan, PIECE, card_min_kib, card_piece_of, card_span_of, joined, joined_piece_runs};
+
+    #[test]
+    fn card_buffer_minimum_accepts_kib_and_rejects_zero() {
+        assert_eq!(card_min_kib(None), None);
+        assert_eq!(card_min_kib(Some(" 64 ")), Some(64 << 10));
+        assert_eq!(card_min_kib(Some("0")), None);
+        assert_eq!(card_min_kib(Some("bad")), None);
+    }
 
     /// Joined runs hold every piece of the runs given, once, and no other.
     #[test]
