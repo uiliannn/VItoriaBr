@@ -707,6 +707,23 @@ fn cvt_norm16_reference(bits: u16, signed: bool) -> u16 {
 }
 
 #[test]
+fn scalar_zero_bit_counts_and_scans_match_rdna2() {
+    // op s12, s0 (s[0:1] for _b64); v_mov_b32 v0, s12.
+    let cases = [[0xFFFF_FFFFu32, 0xFFFF_FFFF, 0, 0], [0xFFFF_FFF7, 0, 0, 0], [0, 0xFFFF_FFFF, 0, 0], [0xFFFF_FFFF, 0x7FFF_FFFF, 0, 0]];
+    for (op, name, want) in [
+        (0x0Du32, "s_bcnt0_i32_b32", [0u32, 1, 32, 0]),
+        (0x0E, "s_bcnt0_i32_b64", [0, 33, 32, 1]),
+        (0x11, "s_ff0_i32_b32", [u32::MAX, 3, 0, u32::MAX]),
+        (0x12, "s_ff0_i32_b64", [u32::MAX, 3, 0, 63]),
+    ] {
+        let shader = build_valu_cs(&[0xBE80_0000 | 12 << 16 | op << 8, vop1(0x001, 0, sgpr(12))]);
+        run_cases(&shader, &cases, |backend, i, _, got| {
+            assert_eq!(got, want[i], "{backend}: {name} case {i} got {got:#010x}, want {:#010x}", want[i]);
+        });
+    }
+}
+
+#[test]
 fn v_cvt_norm_i16_and_u16_f16_round_the_exact_product() {
     // Every 251st f16 pattern, plus the values where an f32 product would
     // round before the rounding to an integer, ties, and the edges.

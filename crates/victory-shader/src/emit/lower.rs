@@ -5524,6 +5524,37 @@ impl<'a> Lower<'a> {
                     self.set(scc, Val::Bit(s));
                     Ok(())
                 }
+                "s_bcnt0_i32_b64" | "s_ff0_i32_b64" => {
+                    // The 64-bit forms of the above: s_bcnt1/s_ff1 of the
+                    // complement; s_bcnt0's SCC = (D != 0).
+                    let ones = self.s.m.i32(u32::MAX);
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let a = self.s.m.bin(c, Bin::Xor, a, ones);
+                    let b = self.s.m.bin(c, Bin::Xor, b, ones);
+                    let i32t = self.s.t.i32;
+                    let op = if name == "s_ff0_i32_b64" { 32 } else { 31 };
+                    let ra = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, op, &[a]);
+                    let rb = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, op, &[b]);
+                    let z = self.s.m.i32(0);
+                    let r = if name == "s_bcnt0_i32_b64" {
+                        self.s.m.bin(c, Bin::Add, ra, rb)
+                    } else {
+                        // In the low dword if any bit there is zero, else
+                        // 32 + the high dword's (or -1 if none at all).
+                        let k32 = self.s.m.i32(32);
+                        let rb32 = self.s.m.bin(c, Bin::Add, rb, k32);
+                        let none = self.s.m.cmp(c, pred::EQ, b, z);
+                        let rb = self.s.m.select(c, none, rb, rb32);
+                        let low = self.s.m.cmp(c, pred::NE, a, z);
+                        self.s.m.select(c, low, ra, rb)
+                    };
+                    self.set(lo, Val::I32(r));
+                    if name == "s_bcnt0_i32_b64" {
+                        let s = self.s.m.cmp(c, pred::NE, r, z);
+                        self.set(scc, Val::Bit(s));
+                    }
+                    Ok(())
+                }
                 "s_ff1_i32_b64" => {
                     // The lowest set bit; -1 for none (as DXIL's first bit low).
                     let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
@@ -5698,6 +5729,19 @@ impl<'a> Lower<'a> {
                 let r = self
                     .s
                     .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a]);
+                (r, None)
+            }
+            "s_ff0_i32_b32" | "s_bcnt0_i32_b32" => {
+                // RDNA2 ISA: the first zero bit from the bottom (-1 for
+                // none), or the number of zero bits: s_ff1/s_bcnt1 of ~S0.
+                // s_bcnt0's SCC = (D != 0), below.
+                let a = src32(self, 0)?;
+                let ones = self.s.m.i32(u32::MAX);
+                let n = self.s.m.bin(c, Bin::Xor, a, ones);
+                let op = if name == "s_ff0_i32_b32" { 32 } else { 31 };
+                let r = self
+                    .s
+                    .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[n]);
                 (r, None)
             }
             "s_ff1_i32_b32" | "s_bcnt1_i32_b32" => {
@@ -11024,6 +11068,49 @@ mod tests {
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    /// `s_bcnt0_i32_b32/b64` and `s_ff0_i32_b32/b64` decode and translate in a
+    /// program that stores the result (`s12` moved to `v0`).
+    #[test]
+    fn scalar_zero_bit_counts_translate() {
+        let program = |body: [u32; 2]| {
+            let mut words = vec![
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0xFA00_0000,
+            ];
+            // v_mov_b32 v1..v4, s0..s3
+            words.extend((0..4u32).map(|i| 0x7E00_0200 | (i + 1) << 17 | i));
+            words.extend(body);
+            words.extend([0xE070_0000, 0x8002_0000, S_ENDPGM]); // buffer_store_dword v0
+            words
+        };
+        let buffer = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let constants = RootParam { sgprs: 4, ..root(RootType::Constants, 0, 0) };
+        for (body, name) in [
+            ([0xBE80_0000 | 12 << 16 | 0x0D << 8, 0x7E00_020C], "s_bcnt0_i32_b32"),
+            ([0xBE80_0000 | 12 << 16 | 0x0E << 8, 0x7E00_020C], "s_bcnt0_i32_b64"),
+            ([0xBE80_0000 | 12 << 16 | 0x11 << 8, 0x7E00_020C], "s_ff0_i32_b32"),
+            ([0xBE80_0000 | 12 << 16 | 0x12 << 8, 0x7E00_020C], "s_ff0_i32_b64"),
+        ] {
+            let code: Vec<u8> = program(body).iter().flat_map(|w| w.to_le_bytes()).collect();
+            let insts = crate::gfx10::decode(&code).unwrap();
+            let names: Vec<_> = insts.iter().map(|i| i.name()).collect();
+            assert!(names.contains(&Some(name)), "{names:?}");
+            let layout = vec![constants, root(RootType::Table, 4, 1)];
+            lower_with(&program(body), layout, vec![buffer])
+                .unwrap_or_else(|e| panic!("{name} {body:08x?}: {e}"));
+        }
+    }
 
     #[test]
     fn automatic_barriers_keep_fences_and_only_drop_unsafe_sync() {
