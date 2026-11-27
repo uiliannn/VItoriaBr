@@ -203,6 +203,39 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
     shader
 }
 
+#[test]
+fn f64_conversions_match_ieee() {
+    // To f64: v_cvt_f64_* v[5:6], v1; v_mov_b32 v0, v5 or v6. From f64:
+    // v_cvt_*32_f64 v0, v[1:2].
+    let d = |x: f64| [x.to_bits() as u32, (x.to_bits() >> 32) as u32];
+    let to_f64: [(u32, &str, fn(u32) -> f64); 3] = [
+        (0x10, "v_cvt_f64_f32", |x| f64::from(f32::from_bits(x))),
+        (0x04, "v_cvt_f64_i32", |x| f64::from(x as i32)),
+        (0x16, "v_cvt_f64_u32", f64::from),
+    ];
+    let xs = [0u32, 1, 0x8000_0000, 0xFFFF_FFFF, 0x3FC0_0000, 0x0000_0001, 0x7F80_0000, 0x1234_5678];
+    let inputs: Vec<[u32; 4]> = xs.iter().map(|&x| [x, 0, 0, 0]).collect();
+    for (op, name, f) in to_f64 {
+        for (h, src) in [(0, 5u8), (1, 6)] {
+            let shader = build_valu_cs(&[0x7E00_0000 | 5 << 17 | op << 9 | 0x101, vop1(0x001, 0, vgpr(src))]);
+            run_cases(&shader, &inputs, |backend, i, _, got| {
+                let want = d(f(xs[i]))[h];
+                assert_eq!(got, want, "{backend}: {name}({:#010x}) dword {h} = {got:#010x}, want {want:#010x}", xs[i]);
+            });
+        }
+    }
+    let ys = [0.0f64, -0.0, 2.9, -2.9, 2147483647.9, 2147483648.0, -2147483648.0, -2147483649.0, 4294967295.5, 4294967296.0, f64::INFINITY, f64::NEG_INFINITY, f64::NAN, 1e-300];
+    let inputs: Vec<[u32; 4]> = ys.iter().map(|&y| { let b = d(y); [b[0], b[1], 0, 0] }).collect();
+    for (op, name, signed) in [(0x03u32, "v_cvt_i32_f64", true), (0x15, "v_cvt_u32_f64", false)] {
+        let shader = build_valu_cs(&[0x7E00_0000 | op << 9 | 0x101]);
+        run_cases(&shader, &inputs, |backend, i, _, got| {
+            // Rust's `as` truncates, saturates and sends NaN to 0, as RDNA2 does.
+            let want = if signed { ys[i] as i32 as u32 } else { ys[i] as u32 };
+            assert_eq!(got, want, "{backend}: {name}({}) = {got:#010x}, want {want:#010x}", ys[i]);
+        });
+    }
+}
+
 /// One GPU test at a time. With these tests on the hardware adapter and WARP
 /// from several test threads at once, now and then none of their dispatches
 /// ever completes and the test binary hangs; and two GPU tests at once on

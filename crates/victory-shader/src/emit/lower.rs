@@ -7731,6 +7731,43 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.cast(c, op, a, self.s.t.i32);
                 int(self, r)
             }
+            "v_cvt_f64_f32" | "v_cvt_f64_i32" | "v_cvt_f64_u32" => {
+                // Exact (AMD's RDNA2 ISA: "0ULP accuracy, denormals are
+                // supported"), built on the bits without host doubles, as
+                // v_cvt_f32_f64 is.
+                let (lo, hi) = if name == "v_cvt_f64_f32" {
+                    let a = f(self, 0)?;
+                    let bits = self.as_int(a);
+                    self.f32_to_f64_bits(bits)
+                } else {
+                    let a = s(self, 0)?;
+                    self.i32_to_f64_bits(a, name == "v_cvt_f64_i32")
+                };
+                if v.clamp || v.omod != 0 {
+                    return Err("f64 output modifiers");
+                }
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("a 64-bit result");
+                };
+                self.write(inst, Reg::V(reg), lo, guard);
+                self.write(inst, Reg::V(reg + 1), hi, guard);
+                Ok(())
+            }
+            "v_cvt_i32_f64" | "v_cvt_u32_f64" => {
+                // Toward zero; out of range (infinities too) saturates and
+                // NaN gives 0 (AMD's RDNA2 ISA). The clamp bit only selects
+                // the INEXACT exception, so it changes nothing here.
+                if v.omod != 0 {
+                    return Err("integer output modifiers");
+                }
+                let (lo, hi) = self.f64_pair(inst, 0)?;
+                let r = self.f64_bits_to_i32(lo, hi, name == "v_cvt_i32_f64");
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("a result without a register");
+                };
+                self.write(inst, Reg::V(reg), r, guard);
+                Ok(())
+            }
             "v_permlane16_b32" | "v_permlanex16_b32" => {
                 // Each lane reads src0 of a lane of its own 32-lane half,
                 // picked by nibble (lane & 15) of {src2, src1}: within its
@@ -8225,6 +8262,159 @@ impl<'a> Lower<'a> {
             hi = self.s.m.bin(c, Bin::Xor, hi, sign);
         }
         Ok((lo, hi))
+    }
+
+    /// The binary64 `(lo, hi)` of the f32 `bits`, exactly: a normal value
+    /// rebiased, a denormal normalized, zero and infinity carried over, a
+    /// NaN with its payload, made quiet.
+    fn f32_to_f64_bits(&mut self, bits: V) -> (V, V) {
+        let c = self.cur;
+        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+        let (k0, k23, k3, k29) = (k(self, 0), k(self, 23), k(self, 3), k(self, 29));
+        let sign_mask = k(self, 0x8000_0000);
+        let sign = self.s.m.bin(c, Bin::And, bits, sign_mask);
+        let man_mask = k(self, 0x7F_FFFF);
+        let man = self.s.m.bin(c, Bin::And, bits, man_mask);
+        let e = self.s.m.bin(c, Bin::LShr, bits, k23);
+        let kff = k(self, 0xFF);
+        let e = self.s.m.bin(c, Bin::And, e, kff);
+        // A denormal m * 2^-149: its leading one (bit 31 - lz) becomes the
+        // implicit bit, the exponent 1023 - 149 + (31 - lz) = 905 - lz.
+        let lz = self
+            .s
+            .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, 33, &[man]);
+        let k8 = k(self, 8);
+        let shift = self.s.m.bin(c, Bin::Sub, lz, k8);
+        let moved = self.s.m.bin(c, Bin::Shl, man, shift);
+        let dman = self.s.m.bin(c, Bin::And, moved, man_mask);
+        let k905 = k(self, 905);
+        let de = self.s.m.bin(c, Bin::Sub, k905, lz);
+        // Normal: e - 127 + 1023; infinity and NaN: 0x7FF.
+        let k896 = k(self, 896);
+        let ne = self.s.m.bin(c, Bin::Add, e, k896);
+        let special = self.s.m.cmp(c, pred::EQ, e, kff);
+        let k7ff = k(self, 0x7FF);
+        let ne = self.s.m.select(c, special, k7ff, ne);
+        let is_denormal = self.s.m.cmp(c, pred::EQ, e, k0);
+        let nonzero = self.s.m.cmp(c, pred::NE, man, k0);
+        let denormal = self.s.m.bin(c, Bin::And, is_denormal, nonzero);
+        let e64 = self.s.m.select(c, denormal, de, ne);
+        let m = self.s.m.select(c, denormal, dman, man);
+        // Zero keeps exponent 0.
+        let yes = self.s.m.bool(true);
+        let is_zero_man = self.s.m.bin(c, Bin::Xor, nonzero, yes);
+        let zero = self.s.m.bin(c, Bin::And, is_denormal, is_zero_man);
+        let e64 = self.s.m.select(c, zero, k0, e64);
+        // The 23 mantissa bits go to the top of the 52: 20 in the high
+        // dword, 3 at the top of the low one.
+        let k20 = k(self, 20);
+        let eh = self.s.m.bin(c, Bin::Shl, e64, k20);
+        let mh = self.s.m.bin(c, Bin::LShr, m, k3);
+        let hi = self.s.m.bin(c, Bin::Or, sign, eh);
+        let hi = self.s.m.bin(c, Bin::Or, hi, mh);
+        // A signalling NaN comes out quiet, as from any conversion.
+        let nan = self.s.m.bin(c, Bin::And, special, nonzero);
+        let quiet = k(self, 0x8_0000);
+        let q = self.s.m.select(c, nan, quiet, k0);
+        let hi = self.s.m.bin(c, Bin::Or, hi, q);
+        let lo = self.s.m.bin(c, Bin::Shl, m, k29);
+        (lo, hi)
+    }
+
+    /// The binary64 `(lo, hi)` of the 32-bit integer `x` (signed or not),
+    /// exactly: its leading one is the implicit bit.
+    fn i32_to_f64_bits(&mut self, x: V, signed: bool) -> (V, V) {
+        let c = self.cur;
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let k0 = k(self, 0);
+        let (sign, mag) = if signed {
+            let neg = self.s.m.cmp(c, pred::SLT, x, k0);
+            let n = self.s.m.bin(c, Bin::Sub, k0, x);
+            let mag = self.s.m.select(c, neg, n, x);
+            let s = k(self, 0x8000_0000);
+            (self.s.m.select(c, neg, s, k0), mag)
+        } else {
+            (k0, x)
+        };
+        // mag (unsigned, so |i32::MIN| = 2^31 is right) = 1.f * 2^p with p
+        // = 31 - lz: exponent 1023 + p, the bits below the leading one the
+        // fraction's top p bits.
+        let lz = self
+            .s
+            .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, 33, &[mag]);
+        let k1 = k(self, 1);
+        // Shifted so the leading one falls off the top (a shift by 32 for
+        // lz = 31 is done in two steps).
+        let t = self.s.m.bin(c, Bin::Shl, mag, lz);
+        let f = self.s.m.bin(c, Bin::Shl, t, k1);
+        let k1054 = k(self, 1054);
+        let e = self.s.m.bin(c, Bin::Sub, k1054, lz);
+        let (k20, k12) = (k(self, 20), k(self, 12));
+        let eh = self.s.m.bin(c, Bin::Shl, e, k20);
+        let fh = self.s.m.bin(c, Bin::LShr, f, k12);
+        let hi = self.s.m.bin(c, Bin::Or, sign, eh);
+        let hi = self.s.m.bin(c, Bin::Or, hi, fh);
+        let lo = self.s.m.bin(c, Bin::Shl, f, k20);
+        let zero = self.s.m.cmp(c, pred::EQ, mag, k0);
+        let hi = self.s.m.select(c, zero, k0, hi);
+        let lo = self.s.m.select(c, zero, k0, lo);
+        (lo, hi)
+    }
+
+    /// The binary64 `(lo, hi)` as a 32-bit integer, toward zero, saturating
+    /// (infinities too), NaN giving 0.
+    fn f64_bits_to_i32(&mut self, lo: V, hi: V, signed: bool) -> V {
+        let c = self.cur;
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let (k0, k20, k31) = (k(self, 0), k(self, 20), k(self, 31));
+        let i64t = self.s.m.int(64);
+        self.s.flags |= flags::INT64;
+        let e = self.s.m.bin(c, Bin::LShr, hi, k20);
+        let k7ff = k(self, 0x7FF);
+        let e = self.s.m.bin(c, Bin::And, e, k7ff);
+        let neg = self.s.m.bin(c, Bin::LShr, hi, k31);
+        let neg = self.s.m.cmp(c, pred::NE, neg, k0);
+        let frac_hi = k(self, 0xF_FFFF);
+        let fh = self.s.m.bin(c, Bin::And, hi, frac_hi);
+        let nan_bits = self.s.m.bin(c, Bin::Or, fh, lo);
+        let is_max_e = self.s.m.cmp(c, pred::EQ, e, k7ff);
+        let has_frac = self.s.m.cmp(c, pred::NE, nan_bits, k0);
+        let nan = self.s.m.bin(c, Bin::And, is_max_e, has_frac);
+        // |x| = (2^52 + f) * 2^(e - 1075); below 1 (e < 1023) truncates to 0.
+        let implicit = k(self, 0x10_0000);
+        let mh = self.s.m.bin(c, Bin::Or, fh, implicit);
+        let mh = self.s.m.cast(c, Cast::ZExt, mh, i64t);
+        let ml = self.s.m.cast(c, Cast::ZExt, lo, i64t);
+        let k32 = self.s.m.int_const(i64t, 32);
+        let mh = self.s.m.bin(c, Bin::Shl, mh, k32);
+        let m = self.s.m.bin(c, Bin::Or, mh, ml);
+        // The shift right, 1075 - e, is at least 20 in range (e <= 1054).
+        let k1075 = k(self, 1075);
+        let sh = self.s.m.bin(c, Bin::Sub, k1075, e);
+        let k63 = k(self, 63);
+        let far = self.s.m.cmp(c, pred::SGT, sh, k63);
+        let sh = self.s.m.select(c, far, k63, sh);
+        let sh = self.s.m.cast(c, Cast::ZExt, sh, i64t);
+        let v = self.s.m.bin(c, Bin::LShr, m, sh);
+        let v = self.s.m.cast(c, Cast::Trunc, v, self.s.t.i32);
+        let k1023 = k(self, 1023);
+        let small = self.s.m.cmp(c, pred::IULT, e, k1023);
+        let v = self.s.m.select(c, small, k0, v);
+        // Big: 2^31 and up (signed), 2^32 and up (unsigned), or infinity.
+        let limit = k(self, if signed { 1023 + 31 } else { 1023 + 32 });
+        let big = self.s.m.cmp(c, pred::IUGE, e, limit);
+        let r = if signed {
+            let n = self.s.m.bin(c, Bin::Sub, k0, v);
+            let r = self.s.m.select(c, neg, n, v);
+            let (min, max) = (k(self, 0x8000_0000), k(self, 0x7FFF_FFFF));
+            let sat = self.s.m.select(c, neg, min, max);
+            self.s.m.select(c, big, sat, r)
+        } else {
+            let max = k(self, u32::MAX);
+            let r = self.s.m.select(c, big, max, v);
+            self.s.m.select(c, neg, k0, r)
+        };
+        self.s.m.select(c, nan, k0, r)
     }
 
     /// Converts IEEE-754 binary64 `(lo, hi)` to binary32 bits with round-to-nearest-even,
@@ -11307,6 +11497,51 @@ mod tests {
         used: Vec<UsedResource>,
     ) -> Result<Lowered, crate::ShaderError> {
         lower_wave(words, layout, used, false)
+    }
+
+    /// `v_cvt_f64_f32`, `v_cvt_f64_i32`, `v_cvt_f64_u32`, `v_cvt_i32_f64` and
+    /// `v_cvt_u32_f64` decode and translate in a program that stores the
+    /// result (an f64 result in `v[5:6]`, its high dword moved to `v0`).
+    #[test]
+    fn f64_conversions_translate() {
+        let program = |body: &[u32]| {
+            let mut words = vec![
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0xFA00_0000,
+            ];
+            // v_mov_b32 v1..v4, s0..s3
+            words.extend((0..4u32).map(|i| 0x7E00_0200 | (i + 1) << 17 | i));
+            words.extend(body);
+            words.extend([0xE070_0000, 0x8002_0000, S_ENDPGM]); // buffer_store_dword v0
+            words
+        };
+        let buffer = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let constants = RootParam { sgprs: 4, ..root(RootType::Constants, 0, 0) };
+        for (body, name) in [
+            (&[0x7E00_0000 | 5 << 17 | 0x10 << 9 | 0x101, 0x7E00_0306][..], "v_cvt_f64_f32"),
+            (&[0x7E00_0000 | 5 << 17 | 0x04 << 9 | 0x101, 0x7E00_0306], "v_cvt_f64_i32"),
+            (&[0x7E00_0000 | 5 << 17 | 0x16 << 9 | 0x101, 0x7E00_0306], "v_cvt_f64_u32"),
+            (&[0x7E00_0000 | 0x03 << 9 | 0x101], "v_cvt_i32_f64"),
+            (&[0x7E00_0000 | 0x15 << 9 | 0x101], "v_cvt_u32_f64"),
+        ] {
+            let code: Vec<u8> = program(body).iter().flat_map(|w| w.to_le_bytes()).collect();
+            let insts = crate::gfx10::decode(&code).unwrap();
+            let names: Vec<_> = insts.iter().map(|i| i.name()).collect();
+            assert!(names.contains(&Some(name)), "{names:?}");
+            let layout = vec![constants, root(RootType::Table, 4, 1)];
+            lower_with(&program(body), layout, vec![buffer])
+                .unwrap_or_else(|e| panic!("{name} {body:08x?}: {e}"));
+        }
     }
 
     /// [`lower_with`] in wave64 if `wave64`.
