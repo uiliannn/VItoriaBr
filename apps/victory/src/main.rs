@@ -145,7 +145,17 @@ enum Console {
 }
 
 fn main() -> Result<()> {
+    let preset = apply_preset_from_env();
     victory_core::logging::init("info");
+    match preset {
+        PresetOutcome::Unset => {}
+        PresetOutcome::Applied { name, count } => {
+            eprintln!("victory: applied VICTORY_PRESET={name} ({count} defaults)");
+        }
+        PresetOutcome::Unknown(value) => {
+            eprintln!("victory: warning: unknown VICTORY_PRESET={value:?}; ignoring");
+        }
+    }
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {
@@ -245,6 +255,66 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
     Ok(all)
 }
 
+/// Default environment overrides for `VICTORY_PRESET=8gb` (8 GB VRAM GPUs
+/// such as Radeon RX 6500 XT over PCIe 3.0 x4, with title files on an HDD).
+const PRESET_8GB: &[(&str, &str)] = &[
+    ("VICTORY_RELAY", "0"),
+    ("VICTORY_FILL_WAIT", "1"),
+    ("VICTORY_CARD_BUFFERS_MB", "1024"),
+    ("VICTORY_TEXTURE_BUDGET_MB", "5120"),
+    ("VICTORY_PAGE_WRITES", "slots"),
+    ("VICTORY_AMBIENT", "0.6"),
+    ("VICTORY_TEXTURE_NO_WAIT", "1"),
+    ("VICTORY_WIDE_REFRESH", "1"),
+    ("VICTORY_WIDE_MERGE", "1"),
+    ("VICTORY_JOIN_COPIES", "1"),
+    ("VICTORY_DISPLAY_MODE", "1920x1080"),
+];
+
+#[derive(Debug, PartialEq, Eq)]
+enum PresetOutcome {
+    Unset,
+    Applied { name: &'static str, count: usize },
+    Unknown(String),
+}
+
+/// Applies `VICTORY_PRESET` defaults using the supplied lookup/setter hooks
+/// without overwriting variables already set by the user.
+fn apply_preset_with(
+    preset: Option<&str>,
+    mut is_set: impl FnMut(&str) -> bool,
+    mut set: impl FnMut(&str, &str),
+) -> PresetOutcome {
+    let Some(raw) = preset.map(str::trim).filter(|s| !s.is_empty()) else {
+        return PresetOutcome::Unset;
+    };
+    let entries: &[(&str, &str)] = match raw.to_ascii_lowercase().as_str() {
+        "8gb" => PRESET_8GB,
+        _ => return PresetOutcome::Unknown(raw.to_owned()),
+    };
+    let mut count = 0;
+    for &(key, value) in entries {
+        if !is_set(key) {
+            set(key, value);
+            count += 1;
+        }
+    }
+    PresetOutcome::Applied { name: "8gb", count }
+}
+
+fn apply_preset_from_env() -> PresetOutcome {
+    let preset = std::env::var("VICTORY_PRESET").ok();
+    apply_preset_with(
+        preset.as_deref(),
+        |key| std::env::var_os(key).is_some_and(|v| !v.is_empty()),
+        |key, value| {
+            // SAFETY: invoked at the very start of `main` before any worker
+            // threads are spawned or other modules read `VICTORY_*`.
+            unsafe { std::env::set_var(key, value) };
+        },
+    )
+}
+
 /// Applies offline `VICTORY_VIEW_LIMIT` and `VICTORY_HOST_WAVE` overrides so
 /// `victory translate` and `victory warm` produce cache keys matching the
 /// runtime device's view-heap cap and wave width.
@@ -266,7 +336,9 @@ fn apply_host_shader_overrides_from_env() {
 
 #[cfg(test)]
 mod tests {
-    use super::apply_host_shader_overrides;
+    use std::collections::HashMap;
+
+    use super::{PRESET_8GB, PresetOutcome, apply_host_shader_overrides, apply_preset_with};
     use victory_shader::emit::{
         host_max_wave, set_host_max_wave, set_view_heap_limit, translation_fingerprint,
         view_heap_limit,
@@ -294,5 +366,120 @@ mod tests {
 
         set_view_heap_limit(prev_limit);
         set_host_max_wave(prev_wave);
+    }
+
+    #[test]
+    fn preset_8gb_sets_all_defaults_when_unset() {
+        let env: std::cell::RefCell<HashMap<String, String>> =
+            std::cell::RefCell::new(HashMap::new());
+        let outcome = apply_preset_with(
+            Some("8gb"),
+            |k| env.borrow().get(k).is_some_and(|v| !v.is_empty()),
+            |k, v| {
+                env.borrow_mut().insert(k.to_owned(), v.to_owned());
+            },
+        );
+        let env = env.into_inner();
+        assert_eq!(
+            outcome,
+            PresetOutcome::Applied {
+                name: "8gb",
+                count: PRESET_8GB.len(),
+            }
+        );
+        assert_eq!(env.get("VICTORY_RELAY").map(String::as_str), Some("0"));
+        assert_eq!(env.get("VICTORY_FILL_WAIT").map(String::as_str), Some("1"));
+        assert_eq!(
+            env.get("VICTORY_CARD_BUFFERS_MB").map(String::as_str),
+            Some("1024")
+        );
+        assert_eq!(
+            env.get("VICTORY_TEXTURE_BUDGET_MB").map(String::as_str),
+            Some("5120")
+        );
+        assert_eq!(
+            env.get("VICTORY_PAGE_WRITES").map(String::as_str),
+            Some("slots")
+        );
+        assert_eq!(env.get("VICTORY_AMBIENT").map(String::as_str), Some("0.6"));
+        assert_eq!(
+            env.get("VICTORY_TEXTURE_NO_WAIT").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            env.get("VICTORY_WIDE_REFRESH").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            env.get("VICTORY_WIDE_MERGE").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            env.get("VICTORY_JOIN_COPIES").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            env.get("VICTORY_DISPLAY_MODE").map(String::as_str),
+            Some("1920x1080")
+        );
+    }
+
+    #[test]
+    fn preset_8gb_preserves_explicit_user_env_vars() {
+        let env = std::cell::RefCell::new(HashMap::from([
+            ("VICTORY_RELAY".to_owned(), "2".to_owned()),
+            ("VICTORY_CARD_BUFFERS_MB".to_owned(), "2048".to_owned()),
+            ("VICTORY_DISPLAY_MODE".to_owned(), "2560x1440".to_owned()),
+        ]));
+        let outcome = apply_preset_with(
+            Some(" 8GB "),
+            |k| env.borrow().get(k).is_some_and(|v| !v.is_empty()),
+            |k, v| {
+                env.borrow_mut().insert(k.to_owned(), v.to_owned());
+            },
+        );
+        let env = env.into_inner();
+        assert_eq!(
+            outcome,
+            PresetOutcome::Applied {
+                name: "8gb",
+                count: PRESET_8GB.len() - 3,
+            }
+        );
+        assert_eq!(env.get("VICTORY_RELAY").map(String::as_str), Some("2"));
+        assert_eq!(
+            env.get("VICTORY_CARD_BUFFERS_MB").map(String::as_str),
+            Some("2048")
+        );
+        assert_eq!(
+            env.get("VICTORY_DISPLAY_MODE").map(String::as_str),
+            Some("2560x1440")
+        );
+        assert_eq!(
+            env.get("VICTORY_TEXTURE_BUDGET_MB").map(String::as_str),
+            Some("5120")
+        );
+    }
+
+    #[test]
+    fn preset_unset_empty_or_unknown_does_not_modify_env() {
+        for (input, expected) in [
+            (None, PresetOutcome::Unset),
+            (Some(""), PresetOutcome::Unset),
+            (Some("   "), PresetOutcome::Unset),
+            (Some("unknown"), PresetOutcome::Unknown("unknown".to_owned())),
+        ] {
+            let env: std::cell::RefCell<HashMap<String, String>> =
+                std::cell::RefCell::new(HashMap::new());
+            let outcome = apply_preset_with(
+                input,
+                |k| env.borrow().get(k).is_some_and(|v| !v.is_empty()),
+                |k, v| {
+                    env.borrow_mut().insert(k.to_owned(), v.to_owned());
+                },
+            );
+            assert_eq!(outcome, expected);
+            assert!(env.borrow().is_empty());
+        }
     }
 }

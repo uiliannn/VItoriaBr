@@ -146,24 +146,21 @@ $env:VICTORY_DISPLAY_MODE = "1920x1080"
 ```
 
 ### Preset para GPUs de 8 GB VRAM (AMD RDNA2 / PCIe x4) + HDD
-O preset acima (`VICTORY_CARD_BUFFERS_MB = "2048"`, `VICTORY_TEXTURE_BUDGET_MB = "10240"`) é dimensionado para placas de 16 GB de VRAM. Em GPUs de **8 GB de VRAM** (como a **Radeon RX 6500 XT**, especialmente em barramentos PCIe 3.0 x4 e com os arquivos em HDD), ajustar os limites de memória para caber com folga evita paginação excessiva, texturas de pele pretas e *driver timeouts* (`0x887A0006`):
+O preset acima (`VICTORY_CARD_BUFFERS_MB = "2048"`, `VICTORY_TEXTURE_BUDGET_MB = "10240"`) é dimensionado para placas de 16 GB de VRAM. Em GPUs de **8 GB de VRAM** (como a **Radeon RX 6500 XT**, especialmente em barramentos PCIe 3.0 x4 e com os arquivos em HDD), use `VICTORY_PRESET=8gb` para ajustar automaticamente os limites de memória e streaming sem sobrescrever nenhuma variável `VICTORY_*` que você definir explicitamente:
 
 ```powershell
 # Mantenha cache_dir e data_dir em um SSD no victory.toml (ex.: C:\victory-data)
-$env:VICTORY_RELAY = "0"
-$env:VICTORY_FILL_WAIT = "1"
-$env:VICTORY_CARD_BUFFERS_MB = "1024"
-$env:VICTORY_TEXTURE_BUDGET_MB = "5120"
-$env:VICTORY_PAGE_WRITES = "slots"
-$env:VICTORY_AMBIENT = "0.6"
-$env:VICTORY_TEXTURE_NO_WAIT = "1"
-$env:VICTORY_WIDE_REFRESH = "1"
-$env:VICTORY_WIDE_MERGE = "1"
-$env:VICTORY_JOIN_COPIES = "1"
-$env:VICTORY_DISPLAY_MODE = "1920x1080"
+$env:VICTORY_PRESET = "8gb"
 
 .\target\release\victory.exe run --execute <pasta_do_jogo>\<executavel_do_titulo>
 ```
+
+Padrões aplicados por `VICTORY_PRESET=8gb` (quando não definidos no ambiente):
+- `VICTORY_RELAY=0`, `VICTORY_FILL_WAIT=1`
+- `VICTORY_CARD_BUFFERS_MB=1024`, `VICTORY_TEXTURE_BUDGET_MB=5120`
+- `VICTORY_PAGE_WRITES=slots`, `VICTORY_AMBIENT=0.6`
+- `VICTORY_TEXTURE_NO_WAIT=1`, `VICTORY_WIDE_REFRESH=1`, `VICTORY_WIDE_MERGE=1`, `VICTORY_JOIN_COPIES=1`
+- `VICTORY_DISPLAY_MODE=1920x1080`
 
 - **Dicas para 16 GB de RAM + HDD:** Feche navegadores e aplicativos pesados antes de iniciar para liberar RAM ao cache de leitura do Windows, e configure um arquivo de paginação (*Pagefile*) manual de **16 GB a 24 GB** no SSD para evitar erro `1455` durante o carregamento.
 
@@ -324,24 +321,21 @@ $env:VICTORY_DISPLAY_MODE = "1920x1080"
 ```
 
 #### Preset for 8 GB VRAM GPUs (AMD RDNA2 / PCIe x4) + HDD
-The 16 GB preset above (`VICTORY_CARD_BUFFERS_MB = "2048"`, `VICTORY_TEXTURE_BUDGET_MB = "10240"`) exceeds 8 GB cards. On **8 GB VRAM GPUs** (such as the **Radeon RX 6500 XT**, especially over PCIe 3.0 x4 and with files on an HDD), lowering the budgets avoids paging, black skin textures, and display driver timeouts (`0x887A0006`):
+The 16 GB preset above (`VICTORY_CARD_BUFFERS_MB = "2048"`, `VICTORY_TEXTURE_BUDGET_MB = "10240"`) exceeds 8 GB cards. On **8 GB VRAM GPUs** (such as the **Radeon RX 6500 XT**, especially over PCIe 3.0 x4 and with files on an HDD), set `VICTORY_PRESET=8gb` to apply safe memory and streaming defaults automatically without overwriting any `VICTORY_*` variable you set explicitly:
 
 ```powershell
 # Keep cache_dir and data_dir on an SSD in victory.toml (e.g. C:\victory-data)
-$env:VICTORY_RELAY = "0"
-$env:VICTORY_FILL_WAIT = "1"
-$env:VICTORY_CARD_BUFFERS_MB = "1024"
-$env:VICTORY_TEXTURE_BUDGET_MB = "5120"
-$env:VICTORY_PAGE_WRITES = "slots"
-$env:VICTORY_AMBIENT = "0.6"
-$env:VICTORY_TEXTURE_NO_WAIT = "1"
-$env:VICTORY_WIDE_REFRESH = "1"
-$env:VICTORY_WIDE_MERGE = "1"
-$env:VICTORY_JOIN_COPIES = "1"
-$env:VICTORY_DISPLAY_MODE = "1920x1080"
+$env:VICTORY_PRESET = "8gb"
 
 .\target\release\victory.exe run --execute <game_dir>\<title_exe>
 ```
+
+Defaults configured by `VICTORY_PRESET=8gb` (when not already set in the environment):
+- `VICTORY_RELAY=0`, `VICTORY_FILL_WAIT=1`
+- `VICTORY_CARD_BUFFERS_MB=1024`, `VICTORY_TEXTURE_BUDGET_MB=5120`
+- `VICTORY_PAGE_WRITES=slots`, `VICTORY_AMBIENT=0.6`
+- `VICTORY_TEXTURE_NO_WAIT=1`, `VICTORY_WIDE_REFRESH=1`, `VICTORY_WIDE_MERGE=1`, `VICTORY_JOIN_COPIES=1`
+- `VICTORY_DISPLAY_MODE=1920x1080`
 
 - **16 GB RAM + HDD tips:** Close browsers and heavy background apps before launching to leave RAM for Windows file caching, and set a manual **16 GB–24 GB** SSD pagefile to prevent Windows error `1455` during loading.
 
