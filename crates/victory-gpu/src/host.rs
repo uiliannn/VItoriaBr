@@ -2866,8 +2866,26 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
 /// that one submission draw with them. `wrote` sees it when the flight
 /// lands (the bytes going into title memory are compared with the ones
 /// there, over every fill that read ahead of them) and from then on fills
-/// wait as before. `VICTORY_FILL_WAIT=1`: they wait from the start.
+/// wait as before. `VICTORY_FILL_WAIT=0`: they skip the wait from the start.
+fn fill_wait_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|value| value != std::ffi::OsStr::new("0"))
+}
+
+#[cfg(test)]
+mod fill_wait_tests {
+    use super::fill_wait_enabled;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn fill_wait_is_safe_by_default_and_can_be_disabled() {
+        assert!(fill_wait_enabled(None));
+        assert!(fill_wait_enabled(Some(OsStr::new("1"))));
+        assert!(!fill_wait_enabled(Some(OsStr::new("0"))));
+    }
+}
+
 mod fill_ahead {
+    use super::fill_wait_enabled;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
     use std::sync::{Mutex, OnceLock};
@@ -2911,7 +2929,8 @@ mod fill_ahead {
 
     pub(super) fn on() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_WAIT").is_none_or(|v| v != "1")) && !WAIT.load(Relaxed)
+        *ON.get_or_init(|| fill_wait_enabled(std::env::var_os("VICTORY_FILL_WAIT").as_deref()))
+            && !WAIT.load(Relaxed)
     }
 
     /// A fill reads `len` bytes at `src` ahead of flights that may write
@@ -2973,7 +2992,7 @@ mod fill_ahead {
                 tracing::warn!(
                     "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders changed \
                      them (first at {:#x}, landed in frame {frame}): the lists of that submission drew with the bytes from before. \
-                     Fills wait for flights again from here on, as with VICTORY_FILL_WAIT=1 ({n} such fills)",
+                     Fills wait for flights again from here on, by default or with VICTORY_FILL_WAIT=1 ({n} such fills)",
                     to - from,
                     a + first
                 );
@@ -3000,7 +3019,7 @@ mod fill_ahead {
             })
         };
         tracing::info!(
-            "fills of upload memory that read title memory flights may write, not waited for (VICTORY_FILL_WAIT=1 waits): {:.1} per \
+            "fills of upload memory that read title memory flights may write, not waited for (waited by default; VICTORY_FILL_WAIT=0 skips): {:.1} per \
              frame; {:.1} landings' writes per frame fell in the same 64 KiB as one and were compared with it; fills that read \
              bytes a flight then changed, since the start: {}{}; {kept} fills kept to check",
             ahead as f64 / frames,
