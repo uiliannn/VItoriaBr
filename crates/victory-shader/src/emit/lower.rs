@@ -5747,12 +5747,19 @@ impl<'a> Lower<'a> {
                 (self.s.m.bin(c, op, a, b), None)
             }
             "s_lshl1_add_u32" | "s_lshl2_add_u32" | "s_lshl3_add_u32" | "s_lshl4_add_u32" => {
+                // SCC is the carry out of the add (AMD's RDNA2 ISA:
+                // "unsigned overflow"), as s_add_u32's: Mesa's ACO fuses
+                // s_lshl_b32 + s_add_u32 into these even where the carry is
+                // read.
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 let k = self.s.m.i32(u32::from(name.as_bytes()[6] - b'0'));
                 let t = self.s.m.bin(c, Bin::Shl, a, k);
-                (self.s.m.bin(c, Bin::Add, t, b), None)
+                let r = self.s.m.bin(c, Bin::Add, t, b);
+                (r, Some(self.s.m.cmp(c, pred::IULT, r, t)))
             }
             "s_min_u32" | "s_max_u32" | "s_min_i32" | "s_max_i32" => {
+                // SCC is the comparison, not whether the result is 0 (AMD's
+                // RDNA2 ISA: SCC = S0 < S1 for min, S0 > S1 for max).
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 let p = match name {
                     "s_min_u32" => pred::IULT,
@@ -5761,7 +5768,7 @@ impl<'a> Lower<'a> {
                     _ => pred::SGT,
                 };
                 let t = self.s.m.cmp(c, p, a, b);
-                (self.s.m.select(c, t, a, b), None)
+                (self.s.m.select(c, t, a, b), Some(t))
             }
             "s_abs_i32" => {
                 let a = src32(self, 0)?;

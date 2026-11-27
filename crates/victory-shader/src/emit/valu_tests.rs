@@ -497,6 +497,29 @@ fn max_and_min_order_negative_zero_below_positive_zero() {
 }
 
 #[test]
+fn scalar_min_max_and_shift_add_set_scc_like_rdna2() {
+    // op s12, s0, s1; s_cselect_b32 s13, 1, 0; v_mov_b32 v0, s13 (v0 = SCC).
+    // s_min: SCC = S0 < S1; s_max: S0 > S1; s_lshl1_add_u32: the carry.
+    let cselect = sop2(0x0A, 13, 0x81, 0x80);
+    let cases = [[5u32, 3, 0, 0], [3, 5, 0, 0], [0, 7, 0, 0], [u32::MAX, 1, 0, 0], [4, 4, 0, 0]];
+    type Scc = fn(u32, u32) -> bool;
+    let ops: [(u8, &str, Scc); 5] = [
+        (6, "s_min_i32", |a, b| (a as i32) < (b as i32)),
+        (7, "s_min_u32", |a, b| a < b),
+        (8, "s_max_i32", |a, b| (a as i32) > (b as i32)),
+        (9, "s_max_u32", |a, b| a > b),
+        (0x2E, "s_lshl1_add_u32", |a, b| (a << 1).checked_add(b).is_none()),
+    ];
+    for (op, name, scc) in ops {
+        let shader = build_valu_cs(&[sop2(op, 12, 0, 1), cselect, vop1(0x001, 0, sgpr(13))]);
+        run_cases(&shader, &cases, |backend, i, inp, got| {
+            let want = u32::from(scc(inp[0], inp[1]));
+            assert_eq!(got, want, "{backend}: SCC after {name} case {i} {inp:x?}: got {got}, want {want}");
+        });
+    }
+}
+
+#[test]
 fn v_med3_f16_matches_rdna2_with_nan() {
     // v_med3_f16 v0, v1, v2, v3 (VOP3 opcode 0x357)
     let shader = build_valu_cs(&vop3(0x357, 0, vgpr(1), vgpr(2), vgpr(3)));
