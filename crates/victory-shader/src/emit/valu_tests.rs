@@ -1197,6 +1197,23 @@ const DS_MAX_RTN_F32: u8 = 0x33;
 const DS_READ_B32: u8 = 0x36;
 
 /// What RDNA2 writes for `ds_max_f32` / `ds_min_f32` over a dword holding
+#[test]
+fn v_sat_pk_u8_i16_clamps_each_signed_half_to_a_byte() {
+    // {16'b0, sat8(hi), sat8(lo)}: each half a signed 16-bit value.
+    let shader = build_valu_cs(&[vop1(0x062, 0, vgpr(1))]);
+    let cases = [
+        (0x0012_0034u32, 0x0000_1234u32),
+        (0x00FF_0100, 0x0000_FFFF),  // 255 stays, 256 saturates
+        (0x8000_FFFF, 0x0000_0000),  // -32768 and -1 give 0
+        (0x7FFF_0080, 0x0000_FF80),
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| [c.0, 0, 0, 0]).collect();
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        let (x, want) = cases[i];
+        assert_eq!(got, want, "{backend}: v_sat_pk_u8_i16({x:#010x}) = {got:#010x}, want {want:#010x}");
+    });
+}
+
 /// `old` with `data` (bits), as measured on gfx1036 with f32 denormals kept:
 /// an sNaN, data first, then memory, is written quieted; otherwise a NaN
 /// loses to a number (two quiet NaNs give the data); numbers compare as

@@ -9121,6 +9121,26 @@ impl<'a> Lower<'a> {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
                 self.mul_hi(a, b, name == "v_mul_hi_i32")
             }
+            "v_sat_pk_u8_i16" => {
+                // RDNA2 ISA: D.u32 = {16'b0, sat8(S0[31:16]), sat8(S0[15:0])},
+                // each half a signed 16-bit value clamped to [0, 255].
+                let a = s(self, 0)?;
+                let (k16, zero, ff) = (k(self, 16), k(self, 0), k(self, 0xFF));
+                let sat = |l: &mut Self, h: V| {
+                    let neg = l.s.m.cmp(c, pred::SLT, h, zero);
+                    let h = l.s.m.select(c, neg, zero, h);
+                    let big = l.s.m.cmp(c, pred::SGT, h, ff);
+                    l.s.m.select(c, big, ff, h)
+                };
+                let lo = self.s.m.bin(c, Bin::Shl, a, k16);
+                let lo = self.s.m.bin(c, Bin::AShr, lo, k16);
+                let lo = sat(self, lo);
+                let hi = self.s.m.bin(c, Bin::AShr, a, k16);
+                let hi = sat(self, hi);
+                let k8 = k(self, 8);
+                let hi = self.s.m.bin(c, Bin::Shl, hi, k8);
+                self.s.m.bin(c, Bin::Or, lo, hi)
+            }
             "v_alignbit_b32" | "v_alignbyte_b32" => {
                 // The low dword of {a, b} >> shift.
                 let (a, b, sh) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
@@ -11148,6 +11168,47 @@ mod tests {
     /// The packed pedestrian layouts of the title: an element
     /// behind another one in its register follows in the first parameter
     /// with a dword left, and is not a half of its register's row.
+    /// `v_sat_pk_u8_i16` decodes (VOP1 and VOP3) and translates in a program
+    /// that stores the result.
+    #[test]
+    fn saturating_byte_pack_translates() {
+        let program = |body: [u32; 2]| {
+            let mut words = vec![
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0xFA00_0000,
+            ];
+            // v_mov_b32 v1..v4, s0..s3
+            words.extend((0..4u32).map(|i| 0x7E00_0200 | (i + 1) << 17 | i));
+            words.extend(body);
+            words.extend([0xE070_0000, 0x8002_0000, S_ENDPGM]); // buffer_store_dword v0
+            words
+        };
+        let buffer = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let constants = RootParam { sgprs: 4, ..root(RootType::Constants, 0, 0) };
+        for (body, name) in [
+            ([0x7E00_0000 | 0x62 << 9 | 0x101, 0x7E00_0000], "v_sat_pk_u8_i16"),
+            ([0xD400_0000 | 0x1E2 << 16, 0x101], "v_sat_pk_u8_i16"),
+        ] {
+            let code: Vec<u8> = program(body).iter().flat_map(|w| w.to_le_bytes()).collect();
+            let insts = crate::gfx10::decode(&code).unwrap();
+            let names: Vec<_> = insts.iter().map(|i| i.name()).collect();
+            assert!(names.contains(&Some(name)), "{names:?}");
+            let layout = vec![constants, root(RootType::Table, 4, 1)];
+            lower_with(&program(body), layout, vec![buffer])
+                .unwrap_or_else(|e| panic!("{name} {body:08x?}: {e}"));
+        }
+    }
+
     #[test]
     fn packed_elements_behind_another_take_the_first_free_dword() {
         use super::super::container::SigElement;
