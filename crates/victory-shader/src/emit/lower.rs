@@ -5604,6 +5604,73 @@ impl<'a> Lower<'a> {
                     self.set(scc, Val::Bit(s));
                     Ok(())
                 }
+                "s_brev_b64" => {
+                    // RDNA2 ISA: D.u64 = the bits of S0.u64 reversed: each
+                    // dword reversed, and the two swapped.
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let i32t = self.s.t.i32;
+                    let ra = self.s.op(c, "unary.i32", Attr::ReadNone, i32t, 30, &[a]);
+                    let rb = self.s.op(c, "unary.i32", Attr::ReadNone, i32t, 30, &[b]);
+                    self.set(lo, Val::I32(rb));
+                    self.set(hi, Val::I32(ra));
+                    Ok(())
+                }
+                "s_bitset0_b64" | "s_bitset1_b64" => {
+                    // RDNA2 ISA: bit S0[5:0] of the 64-bit destination it
+                    // reads is cleared (bitset0) or set (bitset1).
+                    let code = dst_code.ok_or("a missing operand")?;
+                    let n = src32(self, 0)?;
+                    let (k31, k32, one, z) =
+                        (self.s.m.i32(31), self.s.m.i32(32), self.s.m.i32(1), self.s.m.i32(0));
+                    let idx = self.s.m.bin(c, Bin::And, n, k31);
+                    let bit = self.s.m.bin(c, Bin::Shl, one, idx);
+                    let upper = self.s.m.bin(c, Bin::And, n, k32);
+                    let upper = self.s.m.cmp(c, pred::NE, upper, z);
+                    let ones = self.s.m.i32(u32::MAX);
+                    for (h, v) in [(0, lo), (1, hi)] {
+                        let old = inst.read(Reg::S(code + h)).ok_or("an unread operand")?;
+                        let old = self.i32_of(old)?;
+                        // This dword's bit: 0 unless bit 5 picks it.
+                        let mine = if h == 1 {
+                            upper
+                        } else {
+                            let t = self.s.m.bool(true);
+                            self.s.m.bin(c, Bin::Xor, upper, t)
+                        };
+                        let b = self.s.m.select(c, mine, bit, z);
+                        let r = if name == "s_bitset1_b64" {
+                            self.s.m.bin(c, Bin::Or, old, b)
+                        } else {
+                            let nb = self.s.m.bin(c, Bin::Xor, b, ones);
+                            self.s.m.bin(c, Bin::And, old, nb)
+                        };
+                        self.set(v, Val::I32(r));
+                    }
+                    Ok(())
+                }
+                "s_flbit_i32_b64" | "s_flbit_i32_i64" => {
+                    // RDNA2 ISA: the first set bit from the top of S0.u64
+                    // (for the signed form, the first bit that differs from
+                    // the sign), -1 for none.
+                    let (mut a, mut b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    if name == "s_flbit_i32_i64" {
+                        let k31 = self.s.m.i32(31);
+                        let sign = self.s.m.bin(c, Bin::AShr, b, k31);
+                        a = self.s.m.bin(c, Bin::Xor, a, sign);
+                        b = self.s.m.bin(c, Bin::Xor, b, sign);
+                    }
+                    let i32t = self.s.t.i32;
+                    let fa = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 33, &[a]);
+                    let fb = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 33, &[b]);
+                    let (z, k32) = (self.s.m.i32(0), self.s.m.i32(32));
+                    let fa32 = self.s.m.bin(c, Bin::Add, fa, k32);
+                    let none = self.s.m.cmp(c, pred::EQ, a, z);
+                    let fa = self.s.m.select(c, none, fa, fa32);
+                    let high = self.s.m.cmp(c, pred::NE, b, z);
+                    let r = self.s.m.select(c, high, fb, fa);
+                    self.set(lo, Val::I32(r));
+                    Ok(())
+                }
                 "s_mov_b64" => {
                     // Each half by itself: two numbers that travel as a pair (two scalars
                     // parked in neighbouring VGPR lanes, say) need not both have a value.
@@ -11466,6 +11533,51 @@ mod tests {
 
         for words in [add, sub] {
             lowers(&words, 0).unwrap();
+        }
+    }
+
+    /// `s_brev_b64`, `s_bitset0_b64`, `s_bitset1_b64`, `s_flbit_i32_b64` and
+    /// `s_flbit_i32_i64` decode and translate in a program that stores the
+    /// result (`s12` moved to `v0`; `s[12:13]` set first for the bitsets).
+    #[test]
+    fn scalar_64_bit_bit_operations_translate() {
+        let program = |body: &[u32]| {
+            let mut words = vec![
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0xFA00_0000,
+            ];
+            // v_mov_b32 v1..v4, s0..s3
+            words.extend((0..4u32).map(|i| 0x7E00_0200 | (i + 1) << 17 | i));
+            words.extend(body);
+            words.extend([0xE070_0000, 0x8002_0000, S_ENDPGM]); // buffer_store_dword v0
+            words
+        };
+        let buffer = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let constants = RootParam { sgprs: 4, ..root(RootType::Constants, 0, 0) };
+        for (body, name) in [
+            (&[0xBE80_0000 | 12 << 16 | 0x0C << 8, 0x7E00_020C][..], "s_brev_b64"),
+            (&[0xBE8C_0400, 0xBE80_0000 | 12 << 16 | 0x1C << 8 | 2, 0x7E00_020C], "s_bitset0_b64"),
+            (&[0xBE8C_0400, 0xBE80_0000 | 12 << 16 | 0x1E << 8 | 2, 0x7E00_020C], "s_bitset1_b64"),
+            (&[0xBE80_0000 | 12 << 16 | 0x16 << 8, 0x7E00_020C], "s_flbit_i32_b64"),
+            (&[0xBE80_0000 | 12 << 16 | 0x18 << 8, 0x7E00_020C], "s_flbit_i32_i64"),
+        ] {
+            let code: Vec<u8> = program(body).iter().flat_map(|w| w.to_le_bytes()).collect();
+            let insts = crate::gfx10::decode(&code).unwrap();
+            let names: Vec<_> = insts.iter().map(|i| i.name()).collect();
+            assert!(names.contains(&Some(name)), "{names:?}");
+            let layout = vec![constants, root(RootType::Table, 4, 1)];
+            lower_with(&program(body), layout, vec![buffer])
+                .unwrap_or_else(|e| panic!("{name} {body:08x?}: {e}"));
         }
     }
 

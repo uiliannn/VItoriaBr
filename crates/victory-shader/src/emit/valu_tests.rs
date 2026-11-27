@@ -1669,6 +1669,42 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
 }
 
 #[test]
+fn scalar_64_bit_bit_operations_match_rdna2() {
+    // op s[12:13], s[0:1] (s_bitset*: s[12:13] = s[0:1] first, bit s2);
+    // then v_mov_b32 v0, s12 or s13.
+    let reverse = 0xBE80_0000u32 | 12 << 16 | 0x0C << 8;
+    let copy = 0xBE8C_0400u32; // s_mov_b64 s[12:13], s[0:1]
+    let set = |op: u32| [copy, 0xBE80_0000 | 12 << 16 | op << 8 | 2];
+    let cases = [[0x0000_0001u32, 0x8000_0000, 3, 0], [0xFFFF_FFFF, 0x0000_0000, 37, 0], [0, 0, 63, 0], [0x1234_5678, 0xFFFF_FFFF, 0, 0]];
+    type Want = fn([u32; 4]) -> u32;
+    let checks: [(&str, Vec<u32>, u8, Want); 8] = [
+        ("s_brev_b64 (low)", vec![reverse], 12, |x| x[1].reverse_bits()),
+        ("s_brev_b64 (high)", vec![reverse], 13, |x| x[0].reverse_bits()),
+        ("s_bitset1_b64 (low)", set(0x1E).to_vec(), 12, |x| x[0] | if x[2] < 32 { 1 << x[2] } else { 0 }),
+        ("s_bitset1_b64 (high)", set(0x1E).to_vec(), 13, |x| x[1] | if x[2] >= 32 { 1 << (x[2] - 32) } else { 0 }),
+        ("s_bitset0_b64 (low)", set(0x1C).to_vec(), 12, |x| x[0] & !if x[2] < 32 { 1 << x[2] } else { 0 }),
+        ("s_bitset0_b64 (high)", set(0x1C).to_vec(), 13, |x| x[1] & !if x[2] >= 32 { 1 << (x[2] - 32) } else { 0 }),
+        ("s_flbit_i32_b64", vec![0xBE80_0000 | 12 << 16 | 0x16 << 8], 12, |x| {
+            let v = u64::from(x[1]) << 32 | u64::from(x[0]);
+            if v == 0 { u32::MAX } else { v.leading_zeros() }
+        }),
+        ("s_flbit_i32_i64", vec![0xBE80_0000 | 12 << 16 | 0x18 << 8], 12, |x| {
+            let v = u64::from(x[1]) << 32 | u64::from(x[0]);
+            let v = if (v as i64) < 0 { !v } else { v };
+            if v == 0 { u32::MAX } else { v.leading_zeros() }
+        }),
+    ];
+    for (name, mut body, read, want) in checks {
+        body.push(vop1(0x001, 0, sgpr(read)));
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, &cases, |backend, i, inp, got| {
+            let want = want(inp);
+            assert_eq!(got, want, "{backend}: {name} case {i} got {got:#010x}, want {want:#010x}");
+        });
+    }
+}
+
+#[test]
 fn packed_dot_products_and_clamps_execute_cleanly() {
     let [iw0, iw1] = vop3p(0x016, 0, vgpr(1), vgpr(2), vgpr(3));
     let dot4_i8_shader = build_valu_cs(&[iw0, iw1]);
