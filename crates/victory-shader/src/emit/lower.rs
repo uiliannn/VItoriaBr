@@ -321,6 +321,11 @@ struct Lower<'a> {
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
     wave_base: Option<V>,
+    /// A dispatch whose last group may be short, with EXEC on entry the launched lanes
+    /// ([`Structured::launched`]): whether this thread was launched (made in the entry block),
+    /// and the console wave's EXEC on entry as two dwords once asked for.
+    launched: Option<V>,
+    launched_exec: Option<(V, V)>,
     /// Thread-group shared memory dwords allocated by the console program
     /// itself (excluding host wave-exchange and `wave_base` scratch slots).
     lds_dwords: u32,
@@ -1532,7 +1537,13 @@ impl<'a> Lower<'a> {
             // `v_readlane`, `v_writelane`, `ds_(b)permute`, masks as numbers or lane-constant
             // masks), nor when LDS may be shared within the console wave without barriers (a
             // group over 32 threads with LDS): those still need 64-lane waves.
-            if !partial && wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
+            // (a short last group splits only with the launched lanes as EXEC on entry: its
+            // threads past the count then stay to meet the others)
+            if (!partial || x.st.launched)
+                && wave == 64
+                && host_max_wave() == 32
+                && (console_lanes || one_wave && s.lds_dwords > 0)
+            {
                 let crosses = insts().any(|i| {
                     let n = i.name();
                     n.starts_with("v_mbcnt")
@@ -1793,6 +1804,8 @@ impl<'a> Lower<'a> {
             pair: None,
             halves,
             wave_base: None,
+            launched: None,
+            launched_exec: None,
             lds_dwords,
             flat: None,
             no_barrier,
@@ -2450,12 +2463,23 @@ impl<'a> Lower<'a> {
             let unlimited = self.s.m.cmp(original, pred::EQ, limit, zero);
             let inside = self.s.m.cmp(original, pred::IULT, x, limit);
             let active = self.s.m.bin(original, Bin::Or, unlimited, inside);
+            if self.x.st.launched {
+                // The threads past the count run on with their EXEC bit clear, as the
+                // console's lanes past it do ([`Structured::launched`]): the input EXEC is
+                // the launched lanes ([`Self::launched_exec`]).
+                self.launched = Some(active);
+                return self.run_body();
+            }
             let body = self.s.m.new_block();
             let done = self.s.m.new_block();
             self.s.m.terminate(original, Term::CondBr(active, body, done));
             self.s.m.terminate(done, Term::Ret);
             self.s.entry = body;
         }
+        self.run_body()
+    }
+
+    fn run_body(mut self) -> Result<Lowered, Stop> {
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
@@ -2583,6 +2607,13 @@ impl<'a> Lower<'a> {
                 // use as a value (`get`).
                 Reg::V(_) if matches!(io_inputs.get(&v), Some(Input::Barycentric { .. })) => {
                     continue;
+                }
+                // EXEC on entry, of a dispatch whose last group may be short
+                Reg::S(n) if (n == EXEC || n == EXEC + 1) && self.launched.is_some() => {
+                    match self.launched_exec() {
+                        Ok((lo, hi)) => Val::I32(if n == EXEC { lo } else { hi }),
+                        Err(why) => Val::Missing(why),
+                    }
                 }
                 Reg::S(n) => match io_inputs.get(&v) {
                     Some(&input) => self.input(input),
@@ -4003,6 +4034,38 @@ impl<'a> Lower<'a> {
         let mask = self.s.m.i32(!(wave - 1));
         let base = self.s.m.bin(e, Bin::And, first, mask);
         self.s.m.bin(e, Bin::Add, base, lane)
+    }
+
+    /// With [`Self::launched`]: the console wave's EXEC on entry, (lanes 0..31, lanes 32..63),
+    /// the bits of its launched threads. Made in the entry block, which every thread runs:
+    /// each host wave's ballot of its own lanes, which are a 32-aligned run of console lanes
+    /// in order (`console_lane`), and the two exchanged.
+    fn launched_exec(&mut self) -> Result<(V, V), Why> {
+        if let Some(w) = self.launched_exec {
+            return Ok(w);
+        }
+        let active = self.launched.ok_or("a launched-lanes mask without the count")?;
+        let e = self.s.entry;
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        self.s.flags |= flags::WAVE_OPS;
+        let words = match (&self.exchange, self.s.wave_size) {
+            // two host waves of 32 per console wave, which exchange
+            (Some(_), _) if self.local => return Err("a launched-lanes mask in a half-wave"),
+            (Some(_), _) => {
+                let r = self.s.op(e, "waveActiveBallot", Attr::NoUnwind, four, 116, &[active]);
+                let mine = self.s.m.extract(e, r, 0);
+                self.exchange_halves(e, mine)
+            }
+            // the console's waves (64 lanes): the host wave's ballot is the console's
+            (None, Some(64)) if self.halves.is_none() => {
+                let r = self.s.op(e, "waveActiveBallot", Attr::NoUnwind, four, 116, &[active]);
+                (self.s.m.extract(e, r, 0), self.s.m.extract(e, r, 1))
+            }
+            _ => return Err("a launched-lanes mask in waves other than the console's"),
+        };
+        self.launched_exec = Some(words);
+        Ok(words)
     }
 
     /// This thread's console lane (0..63): its relabelled thread index (`thread_id`), whose host

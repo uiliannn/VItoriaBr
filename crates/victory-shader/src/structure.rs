@@ -443,6 +443,29 @@ pub struct Structured {
     /// SCC values a mask operation sets when some lane's bit of its result is set, with that
     /// lane bit: as data such an SCC is "some lane of the wave has it".
     pub scc_some: HashMap<Value, Bool>,
+    /// EXEC on entry is not every lane but the lanes the dispatch launched
+    /// ([`with_launched_exec`]): an [`Atom::Opaque`] of the input EXEC pair, which lowering
+    /// gives as the console wave's launched lanes.
+    pub launched: bool,
+}
+
+thread_local! {
+    static LAUNCHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `f`, with [`structure`] and [`structure_wide`] taking EXEC on entry as the lanes the
+/// dispatch launched rather than every lane ([`Structured::launched`]). A console dispatch of a
+/// thread count that is not a whole number of groups runs its last group short: the lanes
+/// past the count are in the wave with their EXEC bit clear, and code that turns on every
+/// lane (`s_or_saveexec_b64 s, -1`, a whole-wave scan) runs them too, masking what they
+/// hold with the EXEC it saved. Lowering then keeps such lanes running with that bit clear
+/// instead of letting them leave at the start, so a console wave run as two host waves still
+/// has both halves to exchange with.
+pub fn with_launched_exec<R>(f: impl FnOnce() -> R) -> R {
+    let was = LAUNCHED.replace(true);
+    let r = f();
+    LAUNCHED.set(was);
+    r
 }
 
 impl Structured {
@@ -647,8 +670,14 @@ impl<'a> Lanes<'a> {
             } else {
                 lo
             };
-            self.masks.insert((lo, hi), Bool::TRUE);
-            self.active.insert(lo);
+            if LAUNCHED.get() {
+                // the launched lanes: a lane past the dispatch's count has its bit clear
+                let m = self.b.atom(Atom::Opaque(lo), 0);
+                self.masks.insert((lo, hi), m);
+            } else {
+                self.masks.insert((lo, hi), Bool::TRUE);
+                self.active.insert(lo);
+            }
         }
         let mut execs: Vec<Vec<Option<Bool>>> =
             p.blocks.iter().map(|b| vec![None; b.insts.len()]).collect();
@@ -861,6 +890,7 @@ impl<'a> Lanes<'a> {
             exits,
             guards,
             reach: cond.to_vec(),
+            launched: LAUNCHED.get(),
         })
     }
 

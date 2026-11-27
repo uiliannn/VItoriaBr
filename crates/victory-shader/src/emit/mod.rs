@@ -712,7 +712,40 @@ fn emit_program(
         0xba30_5538_e28d_414c_af39_a51a_4bc2_f308
             | 0xd635_3bf6_df15_ff8e_c4aa_aec1_0dbf_3974
     ) && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads == [64, 1, 1]);
-    let l = lower::lower_with_thread_limit(&parts, box_rehydration)?;
+    // A console wave64 program on a host of 32-lane waves: the threads past the count cannot
+    // leave at the start, as they do above, when the two host waves of a console wave exchange
+    // (each meets the other at group barriers). With EXEC on entry the launched lanes
+    // ([`structure::with_launched_exec`]) they run on with their EXEC bit clear, as the
+    // console's lanes past the count do. (`VICTORY_LAUNCHED_EXEC=0`: not tried.)
+    let launched = (box_rehydration
+        && native.wave64
+        && lower::host_max_wave() == 32
+        && !st.launched
+        // (both dwords of EXEC on entry read: the lanes' bits are the pair's)
+        && [ir::EXEC, ir::EXEC + 1].iter().all(|&r| p.inputs.iter().any(|i| i.0 == ir::Reg::S(r)))
+        && std::env::var_os("VICTORY_LAUNCHED_EXEC").is_none_or(|v| v != "0"))
+    .then(|| {
+        let st = structure::with_launched_exec(|| structure::structure_wide(p, &st.wide)).ok()?;
+        let res = resource::track(p, &native.layout, native.stage, Some(&st)).ok()?;
+        let parts = lower::Parts {
+            native,
+            p,
+            st: &st,
+            io,
+            res: &res,
+            inputs: parts.inputs.clone(),
+            outputs: parts.outputs.clone(),
+            prims: parts.prims.clone(),
+            mesh_stride,
+        };
+        let l = lower::lower_with_thread_limit(&parts, true).ok()?;
+        (l.wave_size != Some(64)).then(|| (l, res.root_indexed_views.clone()))
+    })
+    .flatten();
+    let (l, root_indexed_views) = match launched {
+        Some(done) => done,
+        None => (lower::lower_with_thread_limit(&parts, box_rehydration)?, res.root_indexed_views.clone()),
+    };
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,
@@ -736,7 +769,7 @@ fn emit_program(
         root_uavs: l.root_uavs,
         written_root_uavs: l.written_root_uavs,
         writes_guest_memory: l.writes_guest_memory,
-        root_indexed_views: res.root_indexed_views.clone(),
+        root_indexed_views,
     };
     Ok((shader, wave_size))
 }

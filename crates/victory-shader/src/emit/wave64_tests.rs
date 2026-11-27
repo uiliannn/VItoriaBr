@@ -241,6 +241,109 @@ fn partial_thread_dispatch_masks_the_final_groups_memory_writes() {
 }
 
 #[test]
+fn a_short_last_group_in_host_waves_of_32_keeps_its_unlaunched_lanes_out_of_exec() {
+    // One console wave of which the dispatch launched the first n lanes (0: all). Every
+    // launched lane stores the console wave's count of launched lanes twice: `s_bcnt1` of
+    // EXEC on entry, and a whole-wave sum of 1 per lane (`WaveActiveSum` as the console
+    // compiler expands it: every lane takes part, those outside the saved EXEC with 0). Lanes
+    // 32..63 are the other host wave, so both need the halves to exchange, with every thread
+    // of the group still there.
+    let mut words = vec![
+        0xBE94_107E, // s_bcnt1_i32_b64 s20, exec
+        0x7E0E_0281, // v_mov_b32 v7, 1
+    ];
+    // (the wave OR's words with v_add_nc_u32 for v_or_b32: opcode 37 for 28)
+    words.extend(super::wave::WAVE_OR_V7_TO_S7.iter().map(|&w| if w >> 25 == 28 { w & 0x01FF_FFFF | 37 << 25 } else { w }));
+    words.extend_from_slice(&[
+        0x7E08_0214,              // v_mov_b32 v4, s20
+        0x7E0A_0207,              // v_mov_b32 v5, s7
+        0x340C_0083,              // v_lshlrev_b32 v6, 3, v0
+        0xE074_1000, 0x8002_0406, // buffer_store_dwordx2 v[4:5], v6, s[8:11], 0 offen
+    ]);
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let st = structure::with_launched_exec(|| structure::structure(&p)).expect("structure");
+    assert!(st.launched);
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let lowered = lower::lower_with_thread_limit(
+        &lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        },
+        true,
+    );
+    lower::TEST_HOST_WAVE.set(was);
+    let lowered = lowered.expect("lower");
+    // two host waves of 32, not the console's 64
+    assert_ne!(lowered.wave_size, Some(64));
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        written_root_uavs: lowered.written_root_uavs,
+        writes_guest_memory: lowered.writes_guest_memory,
+        root_indexed_views: res.root_indexed_views,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+    }
+    let limit = shader
+        .user_data
+        .iter()
+        .find(|u| u.root == RootType::Other(super::USER_DISPATCH_THREADS_X))
+        .expect("the dispatch's thread count");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        crate::emit::test_skip::skip("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = match host.compute_pipeline(&shader) {
+        Ok(x) => x,
+        Err(e) => {
+            crate::emit::test_skip::skip(&format!("the hardware device does not take this program: {e}; not run"));
+            return;
+        }
+    };
+    for count in [0u32, 1, 7, 31, 32, 33, 40, 41, 63, 64, 65] {
+        let mut constants = vec![0; shader.user_data_dwords() as usize];
+        constants[limit.index as usize] = count;
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(constants))],
+                    views: &[View::RawUav(128)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        let n = if count == 0 { 64 } else { count.min(64) };
+        for lane in 0..64u32 {
+            let got = (out[0][2 * lane as usize], out[0][2 * lane as usize + 1]);
+            let expected = if lane < n { (n, n) } else { (0, 0) };
+            assert_eq!(got, expected, "{count} threads, lane {lane}");
+        }
+    }
+    eprintln!("ran on the hardware device: launched lanes counted and masked across both halves");
+}
+
+#[test]
 fn a_sum_of_halves_over_the_wave_is_the_consoles_tree_bit_for_bit() {
     // thread t holds the 16-bit float with bits 0x3C00 + 37 t (1.0 and up, with odd
     // mantissas, so that additions round); all of them store the wave's sum
