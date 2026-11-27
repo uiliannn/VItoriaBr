@@ -254,4 +254,21 @@ mod tests {
         let data = tmp.path().join("data");
         assert!(resolve_dirs(&data.join("cache"), &data).is_ok());
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn case_variant_data_dir_inside_cache_dir_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        assert!(resolve_dirs(&cache, &tmp.path().join("CACHE")).is_err());
+        assert!(resolve_dirs(&cache, &tmp.path().join("cache").join("saves")).is_err());
+        assert!(resolve_dirs(&cache, &tmp.path().join("CACHE").join("SAVES")).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn case_variant_sibling_is_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(resolve_dirs(&tmp.path().join("cache"), &tmp.path().join("CACHE-old")).is_ok());
+    }
 }

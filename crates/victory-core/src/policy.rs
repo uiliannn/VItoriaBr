@@ -66,7 +66,36 @@ pub fn ensure_outside_repo(path: &Path) -> Result<(), PolicyError> {
 /// `..` (neither path has to exist yet). Compares whole components, so
 /// `cache-old` is not inside `cache`.
 pub fn is_within(path: &Path, root: &Path) -> Result<bool, PolicyError> {
-    Ok(resolve(path)?.starts_with(resolve(root)?))
+    let path = resolve(path)?;
+    let root = resolve(root)?;
+    #[cfg(windows)]
+    {
+        Ok(windows_starts_with(&path, &root))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(path.starts_with(root))
+    }
+}
+
+#[cfg(windows)]
+fn windows_starts_with(path: &Path, root: &Path) -> bool {
+    let mut path_components = path.components();
+    let mut root_components = root.components();
+
+    loop {
+        match (root_components.next(), path_components.next()) {
+            (None, _) => return true,
+            (Some(_), None) => return false,
+            (Some(root), Some(path)) => {
+                if root.as_os_str().to_string_lossy().to_lowercase()
+                    != path.as_os_str().to_string_lossy().to_lowercase()
+                {
+                    return false;
+                }
+            }
+        }
+    }
 }
 
 /// Canonicalizes the longest existing prefix of `path` and re-appends the
@@ -162,5 +191,25 @@ mod tests {
     fn accepts_unrelated_directories() {
         let tmp = tempfile::tempdir().unwrap();
         ensure_outside_repo(&tmp.path().join("does").join("not").join("exist")).unwrap();
+    }
+
+    #[test]
+    fn case_variants_are_detected_for_windows_comparison() {
+        #[cfg(windows)]
+        {
+            let base = std::env::temp_dir();
+            assert!(windows_starts_with(
+                &base.join("CACHE").join("Saves"),
+                &base.join("cache"),
+            ));
+            assert!(windows_starts_with(
+                &base.join("DEPÓSITO").join("SAVES"),
+                &base.join("depósito"),
+            ));
+            assert!(!windows_starts_with(
+                &base.join("cache-old"),
+                &base.join("cache"),
+            ));
+        }
     }
 }
