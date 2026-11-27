@@ -210,7 +210,7 @@ impl Tables {
             })
             .collect();
         let bc7 = (0..DICTIONARY)
-            .map(|_| {
+            .map(|entry| {
                 let mut ep = Bc7Ep {
                     ctrl: r.u16(),
                     ..Default::default()
@@ -222,11 +222,18 @@ impl Tables {
                     bits: [r.u8(), r.u8()],
                     ..Default::default()
                 };
-                // Unused: the widths again in all entries but the first.
-                r.u16();
-                // Only 15 slots for set 1, which no entry uses (0 bits).
-                for v in &mut ix.ix.as_flattened_mut()[..31] {
-                    *v = r.u16() as i16;
+                if entry == 0 {
+                    // The first entry has all 32 indices right after the width
+                    // bytes; every later entry repeats the widths first.
+                    for v in ix.ix.as_flattened_mut() {
+                        *v = r.u16() as i16;
+                    }
+                } else {
+                    r.u16();
+                    // Only 15 slots for set 1, which no entry uses (0 bits).
+                    for v in &mut ix.ix.as_flattened_mut()[..31] {
+                        *v = r.u16() as i16;
+                    }
                 }
                 (ep, ix)
             })
@@ -1592,6 +1599,26 @@ mod tests {
             n += 1;
         }
         assert!(n > 0);
+    }
+
+    #[test]
+    fn bc7_first_dictionary_entry_keeps_all_32_indices() {
+        let mut bytes = tables();
+        let bc7 = MODELS * BUCKETS * 2
+            + 256
+            + 64
+            + 256
+            + 64
+            + 64
+            + 512 * 2
+            + DICTIONARY * (6 + 16 + 8 + 32 + 2 + 16 + 4 + 32 + 25 + 33);
+        // Entry 0: bits, then 32 i16 indices (no repeated width bytes).
+        bytes[bc7 + 50..bc7 + 52].copy_from_slice(&[4, 0]);
+        bytes[bc7 + 52..bc7 + 54].copy_from_slice(&2u16.to_le_bytes());
+        bytes[bc7 + 54..bc7 + 56].copy_from_slice(&1u16.to_le_bytes());
+        let t = Tables::parse(&bytes).unwrap();
+        assert_eq!(t.bc7[0].1.ix[0][0], 2);
+        assert_eq!(t.bc7[0].1.ix[0][1], 1);
     }
 
     /// A dictionary entry stands in for a block the decoder made: a set with

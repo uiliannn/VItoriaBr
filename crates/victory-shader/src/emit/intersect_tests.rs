@@ -182,7 +182,7 @@ fn build(
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
-        samplers: lowered.samplers,
+        samplers: lowered.samplers.iter().map(|&(w, _)| w).collect(),
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
@@ -190,6 +190,7 @@ fn build(
         written_root_uavs: Vec::new(),
         writes_guest_memory: false,
         root_indexed_views: res.root_indexed_views.clone(),
+        half_views: lowered.half_views,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();

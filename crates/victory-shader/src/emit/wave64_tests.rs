@@ -139,7 +139,7 @@ fn lowered_dispatch(
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
-        samplers: lowered.samplers,
+        samplers: lowered.samplers.iter().map(|&(w, _)| w).collect(),
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
@@ -147,6 +147,7 @@ fn lowered_dispatch(
         written_root_uavs: lowered.written_root_uavs,
         writes_guest_memory: lowered.writes_guest_memory,
         root_indexed_views: res.root_indexed_views,
+        half_views: lowered.half_views,
     })
 }
 

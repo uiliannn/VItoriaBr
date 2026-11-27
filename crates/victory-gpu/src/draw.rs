@@ -625,6 +625,8 @@ pub(crate) fn dispatched() -> u64 {
 struct Fresh {
     table: u64,
     n: u32,
+    /// Which entries the shader moves halves through (a mix).
+    halves: u64,
     at: usize,
     first: u32,
 }
@@ -987,13 +989,19 @@ impl State {
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
         use victory_shader::emit::{
-            USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+            USER_DISPATCH_THREADS_X, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
         };
         if kind == USER_DISPATCH_THREADS_X {
             return 0;
         }
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| if dword == 0 { m.base } else { m.count });
+        }
+        if kind == USER_GROUP_BASE {
+            // The first group of the dispatch in x: 0 but for the second
+            // execution of an indirect record split at 65,535 groups, whose
+            // caller sets it itself ([`group_base_word`]).
+            return 0;
         }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
@@ -1228,6 +1236,7 @@ impl State {
                 &t.host.root_indexed_views,
                 &t.used_written,
                 t.write_unknown,
+                &t.host.half_views,
                 compute,
             );
             BINDING_WRITES.set(t.stores);
@@ -2890,6 +2899,14 @@ impl State {
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
+    ///
+    /// `half`: the table descriptors the shader moves sixteen bits a
+    /// channel as unsigned integers (`HostShader::half_views`). A table
+    /// with a 16-bit float or signed buffer view at one of them is made
+    /// afresh as well, with that view in the unsigned format of the same
+    /// layout (`descriptor::host::half_view`): the title's own slot keeps
+    /// the title's format for the shaders that read it as floats.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn tables(
         &mut self,
         list: &HostList,
@@ -2897,6 +2914,7 @@ impl State {
         indexed: &[RootIndexedView],
         written: &[bool],
         unknown_write: bool,
+        half: &[(u8, u32)],
         compute: bool,
     ) -> Vec<(u8, u32)> {
         let writes = |u: &UsedResource| -> bool {
@@ -2915,6 +2933,36 @@ impl State {
             .filter(|u| u.kind == ResourceType::Cbv)
             .map(|u| u.slot)
             .collect();
+        // The view shown in place of the title's at dword `at` of the table
+        // in root parameter `slot`, if the shader moves halves there and
+        // the title's view is a 16-bit float or signed buffer view.
+        let halved = |state: &Self, slot: u8, at: u32| -> Option<View> {
+            if !half.contains(&(slot, at)) {
+                return None;
+            }
+            let Some(&Root::Table(table)) = state.roots_ref(compute).get(usize::from(slot)) else {
+                return None;
+            };
+            crate::descriptor::host::half_view(&crate::descriptor::view(table + u64::from(at) * 4)?)
+        };
+        for &(slot, at) in half {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                continue;
+            };
+            let Some(view) = crate::descriptor::view(table + u64::from(at) * 4) else {
+                continue;
+            };
+            if crate::descriptor::host::half_view(&view).is_some() {
+                if !fresh.contains(&slot) {
+                    fresh.push(slot);
+                }
+            } else if let Some(format) = crate::descriptor::host::half_inexact(&view) {
+                once!(
+                    format,
+                    "a shader moves a buffer's 16-bit channels as integers through a view whose values the console converts: they are read and written unconverted"
+                );
+            }
+        }
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
@@ -2977,6 +3025,15 @@ impl State {
                     index.byte_offset.wrapping_add(constant << index.shift) / 32
                 })
                 .collect();
+            // The descriptors the shader moves halves through are made too,
+            // and the table reaches them: they may lie past the range starts
+            // the entries give (a range of several views names only its
+            // first; review on #927).
+            selected.extend(
+                half.iter()
+                    .filter(|&&(s, _)| s == slot)
+                    .map(|&(_, at)| at / 8),
+            );
             selected.sort_unstable();
             selected.dedup();
             let n = entries
@@ -2993,10 +3050,21 @@ impl State {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
                 continue;
             }
-            let key = table_hash(table, n);
+            // The table, what its entries hold (record words), and which of
+            // them the shader moves halves through (another table than the
+            // same slots made for a shader that reads them in the title's
+            // formats).
+            let halves = half
+                .iter()
+                .filter(|&&(s, at)| s == slot && at / 8 < n)
+                .fold(0u64, |h, &(_, at)| {
+                    h.wrapping_add((u64::from(at) + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(17))
+                });
+            let key = table_hash(table, n) ^ halves;
             let same = self.fresh_tables.get(&key).filter(|f| {
                 f.table == table
                     && f.n == n
+                    && f.halves == halves
                     && self.fresh_records[f.at..f.at + n as usize]
                         .iter()
                         .enumerate()
@@ -3033,7 +3101,7 @@ impl State {
             };
             let at = self.fresh_records.len();
             self.fresh_records.extend((0..n).map(|k| record(table, k)));
-            self.fresh_tables.insert(key, Fresh { table, n, at, first });
+            self.fresh_tables.insert(key, Fresh { table, n, halves, at, first });
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
@@ -3062,7 +3130,10 @@ impl State {
                         }
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        match halved(self, slot, k * 8) {
+                            Some(shown) => host.make_at(index, &shown),
+                            None => host.make_at(index, &view),
+                        }
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
@@ -3461,6 +3532,12 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base, w.step));
+        // A program that reads its group id in x: where it takes the first
+        // group of the dispatch (root parameter, dword), and where the
+        // second records begin once they are made. (Dispatches are never
+        // clamped in windows or gathered, so those paths never see one.)
+        let group_base = if kind == DISPATCH { group_base_word(p) } else { None };
+        let mut second: Option<((u32, u32), u64)> = None;
         // A record that misses its window: a slot the list's prelude fills,
         // if the list still gathers ([`gathers`]).
         let gathered = if hit.is_none() && windowed && gathers() {
@@ -3567,6 +3644,11 @@ impl State {
                 // whose unfilled slots must not spend the list's budget.
                 let bounded = if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
+                } else if let Some(base) = group_base {
+                    // The groups past 65,535 in x run as second records,
+                    // `records` records on in the scratch buffer.
+                    second = Some((base, u64::from(step) * u64::from(records)));
+                    crate::indirect::bound_split(list, (&args.buffer, offset), count_arg, (kind, step, records))
                 } else {
                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
                 };
@@ -3649,6 +3731,25 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        // The groups past 65,535 in x: the second records, with the first
+        // group in x at 65,535 (a dispatch runs at most 65,535 groups in
+        // each dimension). Records that asked for fewer run no groups here.
+        if let Some(((param, dword), offset)) = second {
+            // SAFETY: as above; the compute root signature bound has the
+            // user-data parameter `param` with dword `dword`.
+            unsafe {
+                list.list.SetComputeRoot32BitConstant(param, 65535, dword);
+                list.list.ExecuteIndirect(
+                    &signature,
+                    max,
+                    &bounded,
+                    at + offset,
+                    counter.as_ref().map(|(s, _)| &s.buffer),
+                    counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                );
+                list.list.SetComputeRoot32BitConstant(param, 0, dword);
+            }
+        }
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
@@ -3665,6 +3766,28 @@ impl State {
         }
         true
     }
+}
+
+/// Where the compute program of `p` takes the first thread group of its
+/// dispatch in x (`victory_shader::emit::USER_GROUP_BASE`): its user-data
+/// root parameter and dword. `None` if it does not read the group id in x,
+/// or with `VICTORY_DISPATCH_SPLIT=0`.
+/// shortcut: only programs that read the group id in x run their groups
+/// past 65,535 (a second execution for every indirect dispatch of the
+/// others would double the indirect compute commands of a frame); the
+/// others' are still cut, which matters for one that takes its work from a
+/// counter. The only program seen asking for more in the prologue reads it.
+fn group_base_word(p: &crate::pipeline::host::HostPipeline) -> Option<(u32, u32)> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_DISPATCH_SPLIT").is_none_or(|v| v != "0")) {
+        return None;
+    }
+    p.stages.iter().find_map(|stage| {
+        let (param, _) = stage.user_data?;
+        let base = RootType::Other(victory_shader::emit::USER_GROUP_BASE);
+        let u = stage.translated().host.user_data.iter().find(|u| u.root == base)?;
+        Some((param, u.index))
+    })
 }
 
 /// The host command signature for one argument of `kind` with records

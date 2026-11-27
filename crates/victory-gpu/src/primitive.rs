@@ -127,6 +127,11 @@ fn half_to_f32(h: u16) -> f32 {
 fn f32_to_half(v: f32) -> u16 {
     let bits = v.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
+    let abs = bits & 0x7fff_ffff;
+    // A NaN stays one, quiet, with its payload kept where it fits.
+    if abs > 0x7f80_0000 {
+        return sign | 0x7e00 | ((abs >> 13) as u16 & 0x3ff);
+    }
     let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
     let man = bits & 0x7f_ffff;
     if exp >= 31 {
@@ -147,10 +152,21 @@ fn f32_to_half(v: f32) -> u16 {
         let m = q + u32::from(r > halfway || (r == halfway && (q & 1) != 0));
         return sign | m as u16;
     }
-    // Rounded to nearest: a carry out of the mantissa is added into the
-    // exponent (`2 - 2^-12` is 2.0); at most it reaches infinity, 0x7c00.
-    let half = (exp as u32) << 10;
-    sign | (half + ((man + 0x1000) >> 13)) as u16
+    // Round to nearest even: the 13 dropped bits decide. A carry out of
+    // the mantissa raises the exponent (`2 - 2^-12` is 2.0); at most it
+    // reaches infinity, 0x7c00.
+    let q = man >> 13;
+    let r = man & 0x1fff;
+    let mut m = q + u32::from(r > 0x1000 || (r == 0x1000 && (q & 1) != 0));
+    let mut exp = exp;
+    if m >> 10 != 0 {
+        m &= 0x3ff;
+        exp += 1;
+    }
+    if exp >= 31 {
+        return sign | 0x7c00;
+    }
+    sign | ((exp as u32) << 10) as u16 | m as u16
 }
 
 #[cfg(test)]
@@ -233,5 +249,21 @@ mod tests {
         assert_eq!(f32_to_half(2f32.powi(-26)), 0x0000);
         assert_eq!(f32_to_half(1.5), 0x3e00);
         assert_eq!(half_to_f32(0x0001), 2f32.powi(-24));
+    }
+
+    /// Normal values round to even like the subnormal path: `1 + 2^-11`
+    /// is halfway between `0x3c00` and `0x3c01`, and the even mantissa
+    /// stays. A NaN stays one, quiet (it used to become infinity).
+    #[test]
+    fn f16_halves_round_to_even_and_nan_stays_nan() {
+        assert_eq!(f32_to_half(1.0 + 2f32.powi(-11)), 0x3c00);
+        assert_eq!(f32_to_half(1.0 + 3.0 * 2f32.powi(-11)), 0x3c02);
+        assert_eq!(f32_to_half(2048.0 + 1.0), 0x6800, "a tie above 2048");
+        let nan = f32::from_bits(0x7f80_0000 | 0x200 << 13);
+        assert_eq!(f32_to_half(nan) & 0x7e00, 0x7e00);
+        let negative = f32::from_bits(0xffc0_0000);
+        assert_eq!(f32_to_half(negative) >> 15, 1, "sign kept");
+        assert_eq!(f32_to_half(f32::INFINITY), 0x7c00);
+        assert_eq!(f32_to_half(65520.0), 0x7c00, "finite, but past the largest half");
     }
 }

@@ -8,7 +8,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_TIMEOUT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -577,6 +577,71 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     }
 }
 
+/// How a wait for a submission ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Waited {
+    /// The host signalled the submission's fence.
+    Done,
+    /// The device was removed while the submission ran.
+    Removed,
+    /// Neither after [`STALL_SECS`]: the GPU has faulted or hung and the
+    /// host has not said so.
+    Stalled,
+}
+
+/// How long one wait for a submission lasts before the device is asked
+/// whether it is still there.
+const WAIT_SLICE_MS: u32 = 250;
+
+/// A submission still running after this many seconds is said so, and again
+/// each time that time has doubled.
+const LONG_WAIT_SECS: u64 = 10;
+
+/// A submission still running after this many seconds is given up. A host
+/// whose GPU faults may neither finish the work nor report the device
+/// removed: vkd3d-proton waits on the driver without an end unless
+/// `VKD3D_CONFIG=fault` or `breadcrumbs` is set, and says itself that such
+/// a wait of over 5 s is a lost device. Windows resets a device whose
+/// submission runs for about 2 s. The title ends its own run when its main
+/// thread has waited 30 s for the render thread, which a submission that
+/// never finishes brings about; this is below that, so the run ends with
+/// our report of the cause and not with the title's.
+const STALL_SECS: u64 = 25;
+
+/// Waits for a submission: `signalled` waits one slice ([`WAIT_SLICE_MS`])
+/// for its fence and says whether it came. Between slices `removed` asks
+/// the device whether it was removed, because a host that loses its device
+/// need not signal the fences of the work it dropped (vkd3d-proton after a
+/// GPU fault does not), and a wait without an end then holds the title's
+/// submit thread until the title ends the run, with no report of ours.
+/// `long` is told the seconds waited so far, at [`LONG_WAIT_SECS`] and each
+/// doubling of it; at [`STALL_SECS`] the wait is given up.
+fn wait_for_submission(
+    mut signalled: impl FnMut() -> bool,
+    mut removed: impl FnMut() -> bool,
+    mut long: impl FnMut(u64),
+) -> Waited {
+    let mut slices = 0u64;
+    let mut report_at = LONG_WAIT_SECS;
+    loop {
+        if signalled() {
+            return Waited::Done;
+        }
+        if removed() {
+            return Waited::Removed;
+        }
+        slices += 1;
+        let secs = slices * u64::from(WAIT_SLICE_MS) / 1000;
+        if secs >= STALL_SECS {
+            return Waited::Stalled;
+        }
+        if secs >= report_at {
+            long(secs);
+            report_at *= 2;
+        }
+    }
+}
+
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
@@ -802,6 +867,67 @@ mod tests {
             }
             assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
         }
+    }
+
+    /// A submission's wait ends when its fence comes, or when the device is
+    /// gone and the fence never will.
+    #[test]
+    fn a_wait_for_a_submission_ends_when_the_device_is_removed() {
+        use super::{LONG_WAIT_SECS, STALL_SECS, WAIT_SLICE_MS, Waited, wait_for_submission};
+        let slices_per_sec = 1000 / u64::from(WAIT_SLICE_MS);
+        // The fence comes in the third slice: the device is asked twice.
+        let (mut waits, mut asked) = (0, 0);
+        let done = wait_for_submission(
+            || {
+                waits += 1;
+                waits == 3
+            },
+            || {
+                asked += 1;
+                false
+            },
+            |_| panic!("not a long wait"),
+        );
+        assert_eq!((done, waits, asked), (Waited::Done, 3, 2));
+        // The fence never comes and the device is removed in the fifth slice.
+        let mut asked = 0;
+        let lost = wait_for_submission(
+            || false,
+            || {
+                asked += 1;
+                asked == 5
+            },
+            |_| panic!("not a long wait"),
+        );
+        assert_eq!((lost, asked), (Waited::Removed, 5));
+        // A fence signalled together with the removal is a finished wait:
+        // the caller's check after the submission reports the removal.
+        assert_eq!(wait_for_submission(|| true, || true, |_| ()), Waited::Done);
+        // A long submission on a live device is waited for, and said so at
+        // 10 s and 20 s.
+        let (mut waits, mut said) = (0, Vec::new());
+        let done = wait_for_submission(
+            || {
+                waits += 1;
+                waits > 22 * slices_per_sec
+            },
+            || false,
+            |secs| said.push(secs),
+        );
+        assert_eq!(done, Waited::Done);
+        assert_eq!(said, [LONG_WAIT_SECS, 2 * LONG_WAIT_SECS]);
+        // One that neither finishes nor loses its device is given up, after
+        // every slice of the time allowed and no sooner.
+        let mut waits = 0;
+        let stalled = wait_for_submission(
+            || {
+                waits += 1;
+                false
+            },
+            || false,
+            |_| (),
+        );
+        assert_eq!((stalled, waits), (Waited::Stalled, STALL_SECS * slices_per_sec));
     }
 
     use super::*;
@@ -6036,6 +6162,7 @@ impl Host {
         submitting(2, runs.len());
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
+            let mut ended = Waited::Done;
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
@@ -6048,12 +6175,30 @@ impl Host {
                 match waited {
                     Ok(()) => {
                         working(false);
-                        WaitForSingleObject(self.event, INFINITE);
+                        ended = wait_for_submission(
+                            || WaitForSingleObject(self.event, WAIT_SLICE_MS) != WAIT_TIMEOUT,
+                            || self.device.GetDeviceRemovedReason().is_err(),
+                            |secs| {
+                                tracing::warn!(secs, lists = runs.len(), "host submission still on the GPU");
+                            },
+                        );
                         stood(started);
                         working(true);
                     }
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
+            }
+            match ended {
+                Waited::Done => {}
+                // Nothing more runs on a removed device; reported below.
+                Waited::Removed => break,
+                Waited::Stalled => fail(format_args!(
+                    "host GPU has not finished a submission of {} lists in {STALL_SECS} s and reports \
+                     no removal: the GPU has most likely faulted or hung (on Linux the kernel log \
+                     names a fault){}",
+                    runs.len(),
+                    last_notes(runs)
+                )),
             }
             // With timing on each group is one of `runs` (and the compare
             // of copies in the card's memory, with the last): every

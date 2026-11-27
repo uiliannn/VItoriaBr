@@ -88,6 +88,14 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// global X index is at or past it do nothing. The metadata `dword` holds
 /// the group's X width.
 pub const USER_DISPATCH_THREADS_X: u32 = 0x104;
+/// `RootType::Other` code of a user-data dword the host computes: the
+/// thread-group id in x of the first group of this dispatch, added to the
+/// host's. A dispatch runs at most 65,535 groups in each dimension, the
+/// console's more in x: the host runs the groups past 65,535 of an
+/// indirect record as a second execution with this dword at 65,535, and
+/// sets it to 0 everywhere else. Asked by programs that read the group id
+/// in x.
+pub const USER_GROUP_BASE: u32 = 0x105;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -1098,6 +1106,7 @@ mod tests {
             written_root_uavs: Vec::new(),
             writes_guest_memory: false,
             root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
         };
         let data = [0x1020_3040, 0x100, 320, 20, 0x5060_7080, 0x200, 768, 24];
         let (root, pipeline) = host.compute_pipeline(&shader).expect("view table pipeline");

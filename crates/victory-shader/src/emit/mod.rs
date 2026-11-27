@@ -117,7 +117,7 @@ pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_COUNT, SLOT_VIEW_BYTES, SLOT_VIEWS, SLOT_VIEWS_COUNT, USER_DATA_SPACE,
-    USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    USER_DISPATCH_THREADS_X, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     set_view_heap_limit, view_heap_limit,
 };
 
@@ -284,6 +284,21 @@ pub struct HostShader {
     pub writes_guest_memory: bool,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
+    /// Table descriptors (root parameter, dword offset in the table) whose
+    /// buffer the shader reads or writes sixteen bits a channel
+    /// (`buffer_load_format_d16_*`, `buffer_store_format_d16_*`), in
+    /// order. On the console each channel's 16 bits move as they are
+    /// through a 16-bit float view and through a 16-bit integer one alike
+    /// (the title keeps half floats, and indices beside them, in
+    /// `R16G16B16A16_UINT` and `R16_UINT` buffers). The DXIL moves them as
+    /// unsigned integers, which an unsigned 16-bit view carries unchanged;
+    /// the host shows the shader a 16-bit float or signed buffer view at
+    /// these places as the unsigned format of the same layout.
+    /// shortcut: a view in a normalised 16-bit format, whose values the
+    /// console would convert to halves, is read as its integers; a
+    /// descriptor picked at run time keeps the float path (its slot, and so
+    /// its format, is known only then).
+    pub half_views: Vec<(u8, u32)>,
 }
 
 impl HostShader {
@@ -721,22 +736,22 @@ fn emit_program(
         static_samplers: l
             .samplers
             .iter()
-            .enumerate()
-            .map(|(n, &w)| {
+            .map(|&(w, cmp)| {
                 let mut s = StaticSampler::from_words(w);
-                if l.cmp_samplers >> n & 1 != 0 {
+                if cmp {
                     s.filter |= 0x80;
                 }
                 s
             })
             .collect(),
-        samplers: l.samplers,
+        samplers: l.samplers.iter().map(|&(w, _)| w).collect(),
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
         written_root_uavs: l.written_root_uavs,
         writes_guest_memory: l.writes_guest_memory,
         root_indexed_views: res.root_indexed_views.clone(),
+        half_views: l.half_views,
     };
     Ok((shader, wave_size))
 }
@@ -1126,6 +1141,7 @@ mod tests {
             written_root_uavs: Vec::new(),
             writes_guest_memory: false,
             root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1140,6 +1156,7 @@ mod tests {
                 written_root_uavs: Vec::new(),
                 writes_guest_memory: false,
                 root_indexed_views: Vec::new(),
+                half_views: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -1458,7 +1475,7 @@ mod tests {
             ],
             io: crate::native::StageIo::Cs(crate::native::ComputeIo {
                 rsrc2: 5 << 1,
-                threads: [7, 1, 1],
+                threads: [15, 1, 1],
             }),
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
@@ -1488,23 +1505,56 @@ mod tests {
             v.validate(&mut dxil).unwrap();
         }
         #[cfg(windows)]
-        if let Ok(host) = super::host::Host::new(false) {
+        for warp in [false, true] {
+            let Ok(host) = super::host::Host::new(warp) else {
+                continue;
+            };
             let cs = super::HostShader {
                 stage: super::HwStage::Cs,
-                dxil,
-                user_data: l.user_data,
+                dxil: dxil.clone(),
+                user_data: l.user_data.clone(),
                 samplers: Vec::new(),
                 static_samplers: Vec::new(),
-                root_cbvs: l.root_cbvs,
-                root_srvs: l.root_srvs,
-                root_uavs: l.root_uavs,
-                written_root_uavs: l.written_root_uavs,
+                root_cbvs: l.root_cbvs.clone(),
+                root_srvs: l.root_srvs.clone(),
+                root_uavs: l.root_uavs.clone(),
+                written_root_uavs: l.written_root_uavs.clone(),
                 writes_guest_memory: l.writes_guest_memory,
                 root_indexed_views: Vec::new(),
+                half_views: l.half_views.clone(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
-                7.0f32, 3.0, -1.0, 1e-40, 1.0, 1e35, 1e-35, 1e-36, 0.0, 0.0, -1.0, 0.0, -1e35, 1e35,
+                7.0f32,
+                3.0,
+                -1.0,
+                1e-40,
+                1.0,
+                1e35,
+                1e-35,
+                1e-36,
+                0.0,
+                0.0,
+                -1.0,
+                0.0,
+                -1e35,
+                1e35,
+                0.0,
+                1.0,
+                -0.0,
+                1.0,
+                0.0,
+                -2.0,
+                1.0,
+                f32::INFINITY,
+                -1.0,
+                f32::INFINITY,
+                f32::INFINITY,
+                f32::INFINITY,
+                1e38,
+                1e-38,
+                -1e38,
+                1e-38,
             ]
             .into_iter()
             .map(f32::to_bits)
@@ -1527,29 +1577,163 @@ mod tests {
                     },
                 )
                 .unwrap();
-            let got: Vec<f32> = out[0][..7].iter().copied().map(f32::from_bits).collect();
-            assert!((got[0] - (7.0f32 / 3.0)).abs() < 1e-6, "got {:?}", got);
-            assert_eq!(out[0][1], (-1.0f32 / 1e-40).to_bits());
+            let got: Vec<f32> = out[0][..15].iter().copied().map(f32::from_bits).collect();
+            assert!((got[0] - (7.0f32 / 3.0)).abs() < 1e-6, "warp={warp} got {:?}", got);
+            assert_eq!(out[0][1], (-1.0f32 / 1e-40).to_bits(), "warp={warp}");
             assert!(
                 (got[2] - 1e-35).abs() <= 1e-40,
-                "lane 2 got {:?} ({:#x})",
+                "warp={warp} lane 2 got {:?} ({:#x})",
                 got[2],
                 out[0][2]
             );
             assert!(
                 (got[3] - 10.0).abs() < 1e-5,
-                "lane 3 got {:?} ({:#x})",
+                "warp={warp} lane 3 got {:?} ({:#x})",
                 got[3],
                 out[0][3]
             );
-            assert_eq!(out[0][4], 0xFFC0_0000);
-            assert_eq!(out[0][5], (-1.0f32 / 0.0).to_bits());
+            assert_eq!(out[0][4], 0xFFC0_0000, "warp={warp} 0/0");
+            assert_eq!(out[0][5], (-1.0f32 / 0.0).to_bits(), "warp={warp} -1/0");
             assert!(
                 (got[6] - (-1.0)).abs() < 1e-6,
-                "lane 6 got {:?} ({:#x})",
+                "warp={warp} lane 6 got {:?} ({:#x})",
                 got[6],
                 out[0][6]
             );
+            assert_eq!(out[0][7], 0.0f32.to_bits(), "warp={warp} +0/1");
+            assert_eq!(out[0][8], (-0.0f32).to_bits(), "warp={warp} -0/1");
+            assert_eq!(out[0][9], (-0.0f32).to_bits(), "warp={warp} +0/-2");
+            assert_eq!(out[0][10], 0.0f32.to_bits(), "warp={warp} 1/+Inf");
+            assert_eq!(out[0][11], (-0.0f32).to_bits(), "warp={warp} -1/+Inf");
+            assert_eq!(out[0][12], 0xFFC0_0000, "warp={warp} +Inf/+Inf");
+            assert_eq!(out[0][13], f32::INFINITY.to_bits(), "warp={warp} 1e38/1e-38");
+            assert_eq!(out[0][14], f32::NEG_INFINITY.to_bits(), "warp={warp} -1e38/1e-38");
+        }
+    }
+
+    /// A program that reads its thread-group id in x takes the dispatch's
+    /// first group from a user-data dword the host sets (`USER_GROUP_BASE`)
+    /// and adds the host's group id to it: the host runs the groups past
+    /// 65,535 of an indirect record as a second execution with it at 65,535.
+    #[test]
+    fn the_group_id_in_x_starts_at_the_host_base() {
+        let words: &[u32] = &[
+            0x7E02_0205, // v_mov_b32 v1, s5 (the group id in x)
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0302,
+            0xFA00_0000, // s_load_dwordx4 s[12:15], s[4:5], 0x0
+            0x3610_028F, // v_and_b32 v8, 15, v1
+            0x340E_1082, // v_lshlrev_b32 v7, 2, v8
+            0xE070_1000,
+            0x8003_0107, // buffer_store_dword v1, v7, s[12:15], 0 offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Cs,
+            wave64: false,
+            vgprs: 9,
+            layout: vec![
+                crate::RootParam {
+                    root: crate::RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                crate::RootParam {
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![crate::UsedResource {
+                kind: crate::ResourceType::Uav,
+                root: crate::RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 4,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }],
+            // Five user SGPRs, then the group id in x (s5).
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 5 << 1 | 1 << 7,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, None).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let l = super::lower::lower(&super::lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .unwrap();
+        let base = l
+            .user_data
+            .iter()
+            .find(|u| u.root == crate::RootType::Other(super::USER_GROUP_BASE))
+            .map(|u| u.index as usize)
+            .expect("no user-data dword for the first group");
+        let mut dxil = l.dxil;
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut dxil).unwrap();
+        }
+        #[cfg(windows)]
+        if let Ok(host) = super::host::Host::new(false) {
+            let cs = super::HostShader {
+                stage: super::HwStage::Cs,
+                dxil,
+                user_data: l.user_data,
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: l.root_cbvs,
+                root_srvs: l.root_srvs,
+                root_uavs: l.root_uavs,
+                written_root_uavs: l.written_root_uavs,
+                writes_guest_memory: l.writes_guest_memory,
+                root_indexed_views: Vec::new(),
+                half_views: l.half_views,
+            };
+            let (root, pso) = host.compute_pipeline(&cs).unwrap();
+            // Three groups, with the first at 0 and at 65,535: each stores
+            // the id it read at slot (id & 15).
+            for (first, slots) in [(0u32, [0usize, 1, 2]), (65535, [15, 0, 1])] {
+                let mut constants = vec![0u32; base + 1];
+                constants[base] = first;
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &super::host::Dispatch {
+                            roots: vec![(0, super::host::Root::Constants(constants))],
+                            views: &[super::host::View::RawUav(64)],
+                            samplers: &[],
+                            groups: [3, 1, 1],
+                        },
+                    )
+                    .unwrap();
+                for (k, slot) in slots.into_iter().enumerate() {
+                    assert_eq!(out[0][slot], first + k as u32, "group {k} with the first at {first}: {:?}", &out[0][..16]);
+                }
+            }
         }
     }
 }
