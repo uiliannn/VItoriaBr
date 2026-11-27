@@ -595,13 +595,20 @@ pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
-    {
-        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
-            return;
+    // Keep the staging paths and publication order exclusive through both writes.
+    let mut last = if now {
+        LAST.lock().unwrap_or_else(|e| e.into_inner())
+    } else {
+        match LAST.try_lock() {
+            Ok(last) => last,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
         }
-        *last = Some(std::time::Instant::now());
+    };
+    if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+        return;
     }
+    *last = Some(std::time::Instant::now());
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
@@ -616,7 +623,7 @@ pub(crate) fn save(now: bool) {
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
         let added = library.added.load(Ordering::Relaxed);
-        if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
+        if !USED_CHANGED.load(Ordering::Relaxed) && added == 0 {
             return;
         }
         if added == 0 {
@@ -630,14 +637,22 @@ pub(crate) fn save(now: bool) {
                 let _ = std::fs::remove_file(&tmp);
                 return;
             }
+            if let Err(e) = replace_library(dir, &tmp) {
+                tracing::warn!(error = %e, "host pipeline library not saved");
+                let _ = std::fs::remove_file(&tmp);
+                return;
+            }
             library.added.store(0, Ordering::Relaxed);
             SAVED.store(size as u64, Ordering::Relaxed);
             size
         }
     };
-    let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
-    let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
-    if bytes > 0 && library_written.is_ok() {
+    let used: Vec<String> = {
+        let used = USED.lock().unwrap_or_else(|e| e.into_inner());
+        USED_CHANGED.store(false, Ordering::Relaxed);
+        used.iter().flatten().cloned().collect()
+    };
+    if bytes > 0 {
         // In place unless the system refused and the new one waits beside it.
         let in_place = !dir.join(NEXT_FILE).exists();
         if in_place && VIEW[0].load(Ordering::Relaxed) != 0 {
@@ -651,8 +666,7 @@ pub(crate) fn save(now: bool) {
             )
         });
     }
-    let written = library_written
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+    let written = write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes());
     match written {
         Ok(()) => tracing::info!(
             bytes,
@@ -662,7 +676,10 @@ pub(crate) fn save(now: bool) {
             started_early = EARLY.load(Ordering::Relaxed),
             "host pipeline library saved"
         ),
-        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+        Err(e) => {
+            USED_CHANGED.store(true, Ordering::Relaxed);
+            tracing::warn!(error = %e, "early pipeline list not saved");
+        }
     }
 }
 
@@ -692,7 +709,12 @@ fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usiz
 /// stay: the rest read as zeros). Where a system refuses, the new library
 /// is left beside it as [`NEXT_FILE`] for the next start.
 fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
-    std::fs::rename(tmp, dir.join(LIBRARY_FILE)).or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
+    let next = dir.join(NEXT_FILE);
+    if next.exists() {
+        // Startup prefers this path, so it must hold the newest snapshot.
+        return std::fs::rename(tmp, next);
+    }
+    std::fs::rename(tmp, dir.join(LIBRARY_FILE)).or_else(|_| std::fs::rename(tmp, next))
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
@@ -793,6 +815,18 @@ mod tests {
         // The next start reads the new one, wherever the save left it.
         assert_eq!(Blob::of(dir.path()).bytes(), &new[..]);
         assert!(!dir.path().join(NEXT_FILE).exists());
+    }
+
+    #[test]
+    fn the_newest_save_supersedes_a_pending_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(LIBRARY_FILE), b"old").unwrap();
+        std::fs::write(dir.path().join(NEXT_FILE), b"pending").unwrap();
+        let tmp = dir.path().join(LIBRARY_FILE).with_extension("tmp");
+        std::fs::write(&tmp, b"newest").unwrap();
+
+        replace_library(dir.path(), &tmp).unwrap();
+        assert_eq!(Blob::of(dir.path()).bytes(), b"newest");
     }
 
     /// The bytes at `at` of the pattern the test below writes.

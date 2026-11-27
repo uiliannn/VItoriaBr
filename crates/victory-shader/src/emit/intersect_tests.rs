@@ -661,6 +661,91 @@ fn a_descriptor_of_numbers_is_title_memory_read_through_the_directory() {
 }
 
 #[test]
+fn traversal_requires_resident_bvh_pages_and_requests_only_the_pages_it_reads() {
+    const PAGE: usize = 1 << 16;
+    const PAGE_WORDS: usize = PAGE / 4;
+    const BASE_SLOT: u32 = 2;
+    let (shader, _) = build(true, WHOLE).expect("production page-table shader lowers");
+    let mut constants = vec![0; shader.user_data_dwords() as usize];
+    let memory = shader.user_data.iter().find(|d| d.root == RootType::Other(super::USER_MEMORY_BASE) && d.dword == 0).unwrap();
+    constants[memory.index as usize] = BASE_SLOT;
+    constants[shader.user_data.iter().find(|d| d.root == memory.root && d.dword == 1).unwrap().index as usize] = 2;
+
+    let node = nodes::box32([11, 19, 27, 35], [[-1.0, -1.0, -1.0, 1.0, 1.0, 1.0]; 4]);
+    let ray = Ray::new([0.0; 3], [1.0, 0.0, 0.0], 10.0);
+    let hit = bvh::intersect(&node, 5, &ray, true);
+    assert_eq!(hit, [11, 19, 27, 35]);
+    let mut scene = Scene::new();
+    let n = scene.add(node, 32);
+    let mut records = vec![0; (NODES / 4) as usize];
+    let items = [
+        (4 * PAGE + 0x180, 5, true), // one page
+        (5 * PAGE - 64, 5, true),    // two pages in separate copies
+        (6 * PAGE + 0x180, 5, true), // missing box
+        (6 * PAGE + 0x1c0, 0, true), // missing triangle
+        (7 * PAGE - 64, 5, true),    // missing first span: do not request page 7
+        (8 * PAGE + 0x180, 5, false), // inactive lane: do not request page 8
+    ];
+    let record_words = (RECORD / 4) as usize;
+    for (i, (address, kind, active)) in items.into_iter().enumerate() {
+        let data = buffer(&scene, &[Some((n, kind, ray))], address as u64);
+        let record = &mut records[i * record_words..][..record_words];
+        record.copy_from_slice(&data[..record_words]);
+        record[12] = u32::from(active);
+    }
+
+    // Directory entries specify different byte offsets in different views.
+    let mut first = vec![0; PAGE_WORDS + 16];
+    first[16 + 0x180 / 4..][..28].copy_from_slice(&node);
+    first[PAGE_WORDS..][..16].copy_from_slice(&node[..16]);
+    let mut last = vec![0; PAGE_WORDS + 32];
+    last[32..][..12].copy_from_slice(&node[16..]);
+    let zero_page = vec![0; PAGE_WORDS];
+    let faults = vec![0; super::MEMORY_FAULTS as usize];
+    let views = [
+        View::Buffer { data: &records, stride: Stride::Raw },
+        View::RawUav(4 * THREADS),
+        View::RawUavData(&zero_page),
+        View::RawUavData(&first),
+        View::RawUavData(&last),
+        View::RawUavData(&faults),
+    ];
+
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for warp in [false, true] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root, pso) = host.compute_pipeline(&shader).expect("page-table pipeline");
+        for tail_ready in [false, true] {
+            let mut directory = vec![0; 2 * 9];
+            directory[8..10].copy_from_slice(&[1, 16 * 4]);
+            if tail_ready {
+                directory[10..12].copy_from_slice(&[2, 32 * 4]);
+            }
+            let out = host.dispatch(&root, &pso, &Dispatch {
+                roots: vec![
+                    (0, Root::Constants(constants.clone())),
+                    (1, Root::Uav(4)),
+                    (2, Root::View { srv: true, data: directory }),
+                ],
+                views: &views,
+                samplers: &[],
+                groups: [1, 1, 1],
+            }).expect("dispatch with the production memory bindings");
+            let miss = [bvh::NONE; 4];
+            let wanted = [hit, if tail_ready { hit } else { miss }, miss, bvh::MISS.map(f32::to_bits), miss, BEFORE];
+            for (i, expected) in wanted.iter().enumerate() {
+                assert_eq!(&out[0][i * 4..][..4], expected, "warp={warp}, tail_ready={tail_ready}, lane {i}");
+            }
+            let pages: Vec<_> = out[4][1..].iter().copied().filter(|&p| p != 0).collect();
+            assert_eq!(pages, if tail_ready { vec![6] } else { vec![5, 6] });
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device available");
+}
+
+#[test]
 fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
     // Triangle return mode 0 (bit 24 of dword 3 clear): the last two
     // result dwords would be a triangle id and a hit status.

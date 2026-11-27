@@ -885,6 +885,14 @@ static FUNCTIONS: Table<24> = {
 
 #[cfg(windows)]
 pub(crate) mod host;
+
+/// Set the adapter-dependent translation settings before offline shader warm-up.
+#[cfg(windows)]
+pub fn prepare_shader_warmup() -> Result<(), String> {
+    crate::host::host().ok_or("could not initialize the runtime's D3D12 device for shader warm-up")?;
+    crate::descriptor::host::probe_view_limit();
+    Ok(())
+}
 #[cfg(windows)]
 mod library;
 

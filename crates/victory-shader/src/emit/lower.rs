@@ -1538,7 +1538,6 @@ impl<'a> Lower<'a> {
                     n.starts_with("v_mbcnt")
                         || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                         || n.starts_with("ds_permute")
-                        || n.starts_with("ds_bpermute")
                         || reads_mask_as_data(x.st, i)
                 }) || lane_constant_masks(x.st)
                     || !x.st.wide.is_empty();
@@ -1598,8 +1597,8 @@ impl<'a> Lower<'a> {
                             "v_readlane"
                         } else if n == "v_writelane_b32" {
                             "v_writelane"
-                        } else if n.starts_with("ds_permute") || n.starts_with("ds_bpermute") {
-                            "ds_(b)permute"
+                        } else if n.starts_with("ds_permute") {
+                            "ds_permute"
                         } else if reads_mask_as_data(x.st, i) {
                             "mask as data"
                         } else {
@@ -3104,6 +3103,11 @@ impl<'a> Lower<'a> {
     /// (and drops writes) through the null view at the first slot, and its
     /// number is left for the host, for lanes that run (`guard`).
     fn memory(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V, V) {
+        let (slot, byte, mapped) = self.memory_location(lo, hi, guard);
+        (self.memory_handle(slot), byte, mapped)
+    }
+
+    fn memory_location(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V, V) {
         use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
         let c = self.cur;
         let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
@@ -3166,12 +3170,15 @@ impl<'a> Lower<'a> {
         );
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
-        let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0));
         let k64k = k(self, 0xFFFF);
         let within = self.s.m.bin(c, Bin::And, lo, k64k);
         let byte = self.s.m.bin(c, Bin::Add, start, within);
         let mapped = self.s.m.cmp(c, pred::NE, copy, zero);
-        (h, byte, mapped)
+        (slot, byte, mapped)
+    }
+
+    fn memory_handle(&mut self, slot: V) -> V {
+        self.s.heap_handle(self.cur, slot, false, true, (11 | 0x1000, 0))
     }
 
     /// `global_load_*`, `global_store_*` and `global_atomic_*` on title
@@ -4187,6 +4194,10 @@ impl<'a> Lower<'a> {
         } else {
             self.s.op(at, "waveGetLaneIndex", Attr::ReadOnly, self.s.t.i32, 111, &[])
         };
+        self.mask_lane_bit(at, lane, lo, hi)
+    }
+
+    fn mask_lane_bit(&mut self, at: usize, lane: V, lo: V, hi: Option<V>) -> V {
         let (k31, k32, one, z) = (
             self.s.m.i32(31),
             self.s.m.i32(32),
@@ -4793,37 +4804,38 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if name == "ds_bpermute_b32" {
-            // Backward permute: no LDS is touched. Each lane takes the data
-            // register of the lane its address names, (address + offset) / 4
-            // within the wave; a source lane outside EXEC gives 0. (
-            // the title's checkerboard shadow-mask generators read their
-            // neighbours' samples with it; without them every shadowed light
-            // was multiplied by an empty mask.)
-            // shortcut: a source lane that is not at this instruction on the
-            // host (it left through a branch, not a guard) is read as the
-            // host gives it; the console reads 0.
+            // RDNA2 ISA §10.4.4: wave64 permutes each 32-lane half
+            // independently. Use the host lane's half, not the address.
             self.cross_lane(false)?;
-            if self.exchange.as_ref().is_some_and(|e| !e.1) {
-                // a console wave of 64 run as two host waves: the lane named
-                // may be in the other one
-                return Err("a lane permute across two host waves");
-            }
             let at = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
             let o = self.s.m.i32(offset);
             let at = self.s.m.bin(c, Bin::Add, at, o);
             let two = self.s.m.i32(2);
             let src = self.s.m.bin(c, Bin::LShr, at, two);
-            let last = self.s.m.i32(self.wave() - 1);
-            let src = self.s.m.bin(c, Bin::And, src, last);
-            let x = match guard {
-                Some(g) => {
-                    let z = self.s.m.i32(0);
-                    self.s.m.select(c, g, x, z)
-                }
-                None => x,
+            let mask = self.s.m.i32(31);
+            let src = self.s.m.bin(c, Bin::And, src, mask);
+            let here = self.lane_index();
+            let native_64 = self.s.wave_size == Some(64);
+            let src = if native_64 {
+                let not31 = self.s.m.i32(!31);
+                let half = self.s.m.bin(c, Bin::And, here, not31);
+                self.s.m.bin(c, Bin::Or, half, src)
+            } else {
+                src
             };
-            let r = self.read_lane(x, src);
+            // Never ask the host to read a lane missing from EXEC or absent
+            // from a partial wave. It leaves such reads undefined.
+            let active = guard.unwrap_or_else(|| self.s.m.bool(true));
+            let four = self.s.m.named_struct("dx.types.fouri32", vec![self.s.t.i32; 4]);
+            let ballot = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[active]);
+            let lo = self.s.m.extract(c, ballot, 0);
+            let hi = native_64.then(|| self.s.m.extract(c, ballot, 1));
+            let source_active = self.mask_lane_bit(c, src, lo, hi);
+            let lane = self.s.m.select(c, source_active, src, here);
+            let value = self.read_lane(x, lane);
+            let zero = self.s.m.i32(0);
+            let r = self.s.m.select(c, source_active, value, zero);
             let reg = dst_reg.ok_or("a permute result")?;
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());

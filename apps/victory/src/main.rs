@@ -177,6 +177,9 @@ fn main() -> Result<()> {
             jobs,
             warm,
         } => {
+            if warm.is_some() {
+                victory_hle::modules::d3d12x::prepare_shader_warmup().map_err(anyhow::Error::msg)?;
+            }
             apply_host_shader_overrides_from_env();
             if let Some(file) = warm {
                 return translate::warm(paths, &file, jobs);
@@ -184,6 +187,7 @@ fn main() -> Result<()> {
             translate::run(paths, validate, pipelines, list, jobs)
         }
         Command::Warm { paths, list, jobs } => {
+            victory_hle::modules::d3d12x::prepare_shader_warmup().map_err(anyhow::Error::msg)?;
             apply_host_shader_overrides_from_env();
             warm::run(paths, list, jobs)
         }

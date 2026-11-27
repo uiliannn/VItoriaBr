@@ -36,6 +36,18 @@ fn host_gpu_failed(what: &str) -> ! {
     unreachable!("the process has ended")
 }
 
+/// Detect the adapter settings used by the runtime shader cache.
+pub fn prepare_shader_warmup() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        victory_gpu::pipeline::prepare_shader_warmup()
+    }
+    #[cfg(not(windows))]
+    {
+        Err("shader warm-up requires a D3D12 device on Windows".into())
+    }
+}
+
 /// The offline warm-up: see `victory_gpu::shader_cache::warm`.
 pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
     #[cfg(windows)]
