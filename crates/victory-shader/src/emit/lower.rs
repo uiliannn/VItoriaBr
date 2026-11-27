@@ -3523,6 +3523,40 @@ impl<'a> Lower<'a> {
         self.s.m.cast(self.cur, Cast::Bitcast, x, self.s.t.f32)
     }
 
+    /// `x * 2^n` (`x` an f32, `n` an i32): `n` clamped to `[-limit, limit]`,
+    /// past which every finite non-zero result is already 0 or infinity,
+    /// then applied as `parts` multiplications by powers of two that are
+    /// normal f32 values, all of `n`'s sign. A result in the normal range
+    /// is exact: each step only scales.
+    /// shortcut: a result that ends in the f32 denormals can round twice
+    /// (at the step that leaves the normal range, and again after).
+    fn ldexp(&mut self, x: V, n: V, limit: u32, parts: u32) -> V {
+        let c = self.cur;
+        let (lo, hi) = (self.s.m.i32(limit.wrapping_neg()), self.s.m.i32(limit));
+        let under = self.s.m.cmp(c, pred::SLT, n, lo);
+        let n = self.s.m.select(c, under, lo, n);
+        let over = self.s.m.cmp(c, pred::SGT, n, hi);
+        let mut n = self.s.m.select(c, over, hi, n);
+        let (k127, k23) = (self.s.m.i32(127), self.s.m.i32(23));
+        let mut x = x;
+        for left in (1..=parts).rev() {
+            // This part: what is left of n, divided by the parts left
+            // (truncated, so it has n's sign or is 0).
+            let part = if left == 1 {
+                n
+            } else {
+                let d = self.s.m.i32(left);
+                self.s.m.bin(c, Bin::SDiv, n, d)
+            };
+            n = self.s.m.bin(c, Bin::Sub, n, part);
+            let e = self.s.m.bin(c, Bin::Add, part, k127);
+            let bits = self.s.m.bin(c, Bin::Shl, e, k23);
+            let scale = self.as_float(bits);
+            x = self.s.m.bin(c, Bin::Mul, x, scale);
+        }
+        x
+    }
+
     fn as_int(&mut self, f: V) -> V {
         self.s.m.cast(self.cur, Cast::Bitcast, f, self.s.t.i32)
     }
@@ -7327,6 +7361,15 @@ impl<'a> Lower<'a> {
                 self.write(inst, Reg::V(reg + 1), hi, guard);
                 Ok(())
             }
+            "v_ldexp_f32" => {
+                // RDNA2 ISA: D.f = S0.f * 2^S1.i, S1 a signed integer.
+                if v.abs >> 1 & 1 != 0 || v.neg >> 1 & 1 != 0 {
+                    return Err("float modifiers on an integer operand");
+                }
+                let (a, n) = (f(self, 0)?, s(self, 1)?);
+                let r = self.ldexp(a, n, 279, 3);
+                float(self, r)
+            }
             "v_cubeid_f32" | "v_cubesc_f32" | "v_cubetc_f32" | "v_cubema_f32" => {
                 // Cube-map face coordinates (AMD's ISA): the major axis is z
                 // when |z| >= |x| and |z| >= |y|, else y when |y| >= |x|,
@@ -8518,6 +8561,7 @@ impl<'a> Lower<'a> {
             "v_mul_f16",
             "v_max_f16",
             "v_min_f16",
+            "v_ldexp_f16",
         ];
         const FLOAT3: &[&str] = &[
             "v_fma_f16",
@@ -8616,6 +8660,21 @@ impl<'a> Lower<'a> {
         if name == "v_cvt_f16_f32" {
             let f = self.fsrc(inst, 0)?;
             return float_result(self, f);
+        }
+        if name == "v_ldexp_f16" {
+            // RDNA2 ISA: D.f16 = S0.f16 * 2^S1.i16. In f32 the f16 times
+            // 2^n is exact for |n| <= 41, past which every finite non-zero
+            // f16 result is 0 or infinity; the f16 conversion rounds once.
+            if v.abs >> 1 & 1 != 0 || v.neg >> 1 & 1 != 0 {
+                return Err("float modifiers on an integer operand");
+            }
+            let a = self.half_fsrc(inst, 0)?;
+            let n = self.half_src(inst, 1)?;
+            let k16 = self.s.m.i32(16);
+            let n = self.s.m.bin(self.cur, Bin::Shl, n, k16);
+            let n = self.s.m.bin(self.cur, Bin::AShr, n, k16);
+            let r = self.ldexp(a, n, 41, 1);
+            return float_result(self, r);
         }
         if float2.contains(&name) {
             let (a, b) = (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?);
@@ -11346,6 +11405,50 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
+    }
+
+    /// `v_ldexp_f32` (VOP3) and `v_ldexp_f16` (VOP2 and VOP3) decode and
+    /// translate in a program that stores the result.
+    #[test]
+    fn ldexp_translates() {
+        let program = |body: [u32; 2]| {
+            let mut words = vec![
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0xFA00_0000,
+            ];
+            // v_mov_b32 v1..v4, s0..s3
+            words.extend((0..4u32).map(|i| 0x7E00_0200 | (i + 1) << 17 | i));
+            words.extend(body);
+            words.extend([0xE070_0000, 0x8002_0000, S_ENDPGM]); // buffer_store_dword v0
+            words
+        };
+        let buffer = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let constants = RootParam { sgprs: 4, ..root(RootType::Constants, 0, 0) };
+        let vop3 = |op: u32| [0xD400_0000 | op << 16, 0x101 | 0x102 << 9];
+        // The VOP2 form is one word; v_nop pads it to two.
+        for (body, name) in [
+            (vop3(0x362), "v_ldexp_f32"),
+            (vop3(0x13B), "v_ldexp_f16"),
+            ([0x3B << 25 | 2 << 9 | 0x101, 0x7E00_0000], "v_ldexp_f16"),
+        ] {
+            let code: Vec<u8> = program(body).iter().flat_map(|w| w.to_le_bytes()).collect();
+            let insts = crate::gfx10::decode(&code).unwrap();
+            let names: Vec<_> = insts.iter().map(|i| i.name()).collect();
+            assert!(names.contains(&Some(name)), "{names:?}");
+            let layout = vec![constants, root(RootType::Table, 4, 1)];
+            lower_with(&program(body), layout, vec![buffer])
+                .unwrap_or_else(|e| panic!("{name} {body:08x?}: {e}"));
+        }
     }
 
     /// Root parameter `slot` in user SGPRs from `user_data` on.

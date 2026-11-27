@@ -960,6 +960,48 @@ fn v_sin_and_v_cos_f16_reduce_large_turns() {
 /// unsigned one's is zero-extended): -100 compared with `v[1:2]`, and
 /// shifted by `s_ashr_i64`.
 #[test]
+fn v_ldexp_f32_and_f16_scale_by_powers_of_two() {
+    let f = f32::to_bits;
+    // v_ldexp_f32 v0, v1, v2 (VOP3 0x362): normal results, overflow, and
+    // exponents far out of range (clamped, so they cannot wrap).
+    let cases: &[(u32, u32, u32)] = &[
+        (f(1.5), 3, f(12.0)),
+        (f(1.0), (-126i32) as u32, 0x0080_0000),
+        (f(1.0), 127, 0x7F00_0000),
+        (f(1.0), 128, 0x7F80_0000),
+        (f(-3.0), i32::MAX as u32, 0xFF80_0000),
+        (f(3.0), i32::MIN as u32, 0),
+        (f(-0.0), 10, 0x8000_0000),
+        (f(f32::MAX), (-127i32) as u32, f(f32::MAX / 2f32.powi(127))),
+    ];
+    let [w0, w1] = vop3(0x362, 0, vgpr(1), vgpr(2), 0);
+    let shader = build_valu_cs(&[w0, w1]);
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| [c.0, c.1, 0, 0]).collect();
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        let want = cases[i].2;
+        assert_eq!(got, want, "{backend}: v_ldexp_f32 case {i} got {got:#010x}, want {want:#010x}");
+    });
+
+    // v_ldexp_f16 v0, v1, v2 (VOP2 0x3B): only S1's low 16 bits count, as
+    // a signed exponent; v0's high half (0) is kept.
+    let cases: &[(u32, u32, u32)] = &[
+        (0x3E00, 3, 0x4A00),          // 1.5 * 8 = 12
+        (0x3C00, 15, 0x7800),         // 32768
+        (0x3C00, 16, 0x7C00),         // 65536 overflows
+        (0x3C00, (-24i32) as u32, 1), // the smallest denormal, exactly
+        (0x3C00, 0x1234_0002, 0x4400),
+        (0x3C00, 0x0000_8000, 0), // -32768
+        (0xBC00, 0xFFFF_FFFF, 0xB800), // -1 * 2^-1
+    ];
+    let shader = build_valu_cs(&[0x3B << 25 | 2 << 9 | 0x101]);
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| [c.0, c.1, 0, 0]).collect();
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        let want = cases[i].2;
+        assert_eq!(got, want, "{backend}: v_ldexp_f16 case {i} got {got:#010x}, want {want:#010x}");
+    });
+}
+
+#[test]
 fn signed_64_bit_operands_sign_extend_their_literal() {
     const MINUS_100: u32 = -100_i32 as u32;
     let check = |name: &str, body: &[u32], cases: &[([u32; 4], u32)]| {
