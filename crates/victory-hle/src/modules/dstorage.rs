@@ -113,6 +113,12 @@ fn from_win32(error: &std::io::Error) -> HRESULT {
 
 type Factory = *const Object;
 
+const FILE_FLAG_OVERLAPPED: u32 = 0x40000000;
+
+fn dstorage_open_flags() -> u32 {
+    FILE_FLAG_OVERLAPPED
+}
+
 /// Opens `path` for reading; the file object owns the handle.
 extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out: Out) -> HRESULT {
     const GENERIC_READ: u32 = 0x8000_0000;
@@ -128,7 +134,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         FILE_SHARE_READ,
         std::ptr::null(),
         OPEN_EXISTING,
-        0,
+        dstorage_open_flags(),
         std::ptr::null_mut(),
     );
     // SAFETY: the title passes a NUL-terminated path.
@@ -1255,6 +1261,11 @@ mod tests {
 
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    #[test]
+    fn dstorage_files_open_for_overlapped_reads() {
+        assert_eq!(dstorage_open_flags(), FILE_FLAG_OVERLAPPED);
+    }
 
     fn call<F: Copy>(object: *mut c_void, slot: usize) -> F {
         // SAFETY: every object here starts with the runtime header.
