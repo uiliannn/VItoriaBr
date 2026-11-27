@@ -9201,6 +9201,30 @@ impl<'a> Lower<'a> {
                     }
                 }
             }
+            "v_lerp_u8" => {
+                // RDNA2 ISA: each byte is the average of S0's and S1's,
+                // rounded up when bit 0 of S2's byte is set:
+                // D.u[8i+7:8i] = (S0.u[8i+7:8i] + S1.u[8i+7:8i] + S2.u[8i]) >> 1.
+                let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let (ff, one) = (k(self, 0xFF), k(self, 1));
+                let mut r = k(self, 0);
+                for i in 0..4u32 {
+                    let sh = k(self, 8 * i);
+                    let byte = |l: &mut Self, x: V| {
+                        let t = l.s.m.bin(c, Bin::LShr, x, sh);
+                        l.s.m.bin(c, Bin::And, t, ff)
+                    };
+                    let (x, y) = (byte(self, a), byte(self, b));
+                    let round = self.s.m.bin(c, Bin::LShr, d, sh);
+                    let round = self.s.m.bin(c, Bin::And, round, one);
+                    let sum = self.s.m.bin(c, Bin::Add, x, y);
+                    let sum = self.s.m.bin(c, Bin::Add, sum, round);
+                    let avg = self.s.m.bin(c, Bin::LShr, sum, one);
+                    let avg = self.s.m.bin(c, Bin::Shl, avg, sh);
+                    r = self.s.m.bin(c, Bin::Or, r, avg);
+                }
+                r
+            }
             "v_perm_b32" => {
                 // Byte i of the result is byte S of {src0, src1} (src1 the
                 // low dword) for selector byte S below 8; 8-11 repeat the
@@ -11780,6 +11804,48 @@ mod tests {
             _ => (1024 + m) as f32 * 2f32.powi(e as i32 - 25),
         };
         if s == 1 { -v } else { v }
+    }
+
+    /// `v_lerp_u8` decodes and translates in a program that stores the result
+    /// (with src2 a VGPR or an SGPR).
+    #[test]
+    fn byte_average_translates() {
+        let program = |body: [u32; 2]| {
+            let mut words = vec![
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0xFA00_0000,
+            ];
+            // v_mov_b32 v1..v4, s0..s3
+            words.extend((0..4u32).map(|i| 0x7E00_0200 | (i + 1) << 17 | i));
+            words.extend(body);
+            words.extend([0xE070_0000, 0x8002_0000, S_ENDPGM]); // buffer_store_dword v0
+            words
+        };
+        let buffer = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let constants = RootParam { sgprs: 4, ..root(RootType::Constants, 0, 0) };
+        for (body, name) in [
+            ([0xD400_0000 | 0x14D << 16, 0x101 | 0x102 << 9 | 0x103 << 18], "v_lerp_u8"),
+            // src2 an SGPR (s3)
+            ([0xD400_0000 | 0x14D << 16, 0x101 | 0x102 << 9 | 3 << 18], "v_lerp_u8"),
+        ] {
+            let code: Vec<u8> = program(body).iter().flat_map(|w| w.to_le_bytes()).collect();
+            let insts = crate::gfx10::decode(&code).unwrap();
+            let names: Vec<_> = insts.iter().map(|i| i.name()).collect();
+            assert!(names.contains(&Some(name)), "{names:?}");
+            let layout = vec![constants, root(RootType::Table, 4, 1)];
+            lower_with(&program(body), layout, vec![buffer])
+                .unwrap_or_else(|e| panic!("{name} {body:08x?}: {e}"));
+        }
     }
 
     #[test]

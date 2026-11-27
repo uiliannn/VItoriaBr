@@ -1342,6 +1342,25 @@ fn ds_min_max_f32_are_atomic_across_waves() {
 }
 
 #[test]
+fn v_lerp_u8_averages_bytes_rounding_by_s2() {
+    // Per byte (a + b + S2's bit 0 of that byte) >> 1.
+    let [w0, w1] = vop3(0x14D, 0, vgpr(1), vgpr(2), vgpr(3));
+    let shader = build_valu_cs(&[w0, w1]);
+    let cases = [
+        ([0x0102_0304u32, 0x0304_0506, 0], 0x0203_0405u32),
+        ([0x0102_0304, 0x0203_0405, 0], 0x0102_0304), // .5 truncates
+        ([0x0102_0304, 0x0203_0405, 0x0101_0101], 0x0203_0405), // .5 rounds up
+        ([0xFFFF_FFFF, 0xFFFF_FFFF, 0xFEFE_FEFF], 0xFFFF_FFFF), // only bit 0 counts
+        ([0xFF00_FF00, 0x00FF_00FF, 0x0100_0001], 0x807F_7F80),
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| [c.0[0], c.0[1], c.0[2], 0]).collect();
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        let want = cases[i].1;
+        assert_eq!(got, want, "{backend}: v_lerp_u8 case {i} got {got:#010x}, want {want:#010x}");
+    });
+}
+
+#[test]
 fn v_cmp_class_f16_matches_rdna2() {
     // v_cmp_class_f16_e64 s6, v1, v2 (VOP3 opcode 0x08f); v_cndmask_b32_e64 v0, 0, 1, s6
     let cmp_lo = build_valu_cs(&[
