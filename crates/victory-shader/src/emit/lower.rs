@@ -7769,8 +7769,22 @@ impl<'a> Lower<'a> {
                 let r = self.read_lane(x, from);
                 int(self, r)
             }
-            "v_cvt_f32_i32" | "v_cvt_f32_u32" | "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1"
-            | "v_cvt_f32_ubyte2" | "v_cvt_f32_ubyte3" => {
+            "v_cvt_f32_u32" => {
+                // WARP can misround a full-width uitofp. Each 16-bit
+                // half and the scaled high half are exact in f32, so the
+                // sum rounds just once, whether the host fuses FMad or not.
+                let a = s(self, 0)?;
+                let (shift, mask) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
+                let hi = self.s.m.bin(c, Bin::LShr, a, shift);
+                let lo = self.s.m.bin(c, Bin::And, a, mask);
+                let hi = self.s.m.cast(c, Cast::SiToFp, hi, self.s.t.f32);
+                let lo = self.s.m.cast(c, Cast::SiToFp, lo, self.s.t.f32);
+                let scale = self.s.m.f32(65_536.0f32.to_bits());
+                let r = self.fmad(hi, scale, lo);
+                float(self, r)
+            }
+            "v_cvt_f32_i32" | "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1" | "v_cvt_f32_ubyte2"
+            | "v_cvt_f32_ubyte3" => {
                 let mut a = s(self, 0)?;
                 if let Some(n) = name.strip_prefix("v_cvt_f32_ubyte") {
                     let sh = self.s.m.i32(8 * u32::from(n.as_bytes()[0] - b'0'));
