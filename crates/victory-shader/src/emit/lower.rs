@@ -260,6 +260,9 @@ struct Lower<'a> {
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
+    /// [`Lower::handles`] of buffer size queries, which share no handle
+    /// with an access ([`Lower::swap_size_caches`]).
+    size_handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
     /// Element strides read from the host's table by heap slot
     /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
     strides: HashMap<(usize, Site, u8), V>,
@@ -1764,6 +1767,7 @@ impl<'a> Lower<'a> {
                 m
             },
             handles: HashMap::new(),
+            size_handles: HashMap::new(),
             strides: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
@@ -6257,7 +6261,18 @@ impl<'a> Lower<'a> {
         (first, props, image, uav, used)
         };
         let src = Source::Loaded { load: site, first };
+        // The accesses' handle, made while the load is lowered and not at
+        // the first access: where it is written does not depend on whether
+        // a size is read.
         let h = self.handle(site, &src, false, props)?;
+        let h = if image.is_some() {
+            h
+        } else {
+            self.swap_size_caches();
+            let own = self.handle(site, &src, false, props);
+            self.swap_size_caches();
+            own?
+        };
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
@@ -6692,6 +6707,12 @@ impl<'a> Lower<'a> {
                     && u.table_offset_dwords <= dword
             })
             .max_by_key(|u| u.table_offset_dwords)
+    }
+
+    /// Trades the handle caches of accesses for those of buffer size queries,
+    /// and back when called again.
+    fn swap_size_caches(&mut self) {
+        std::mem::swap(&mut self.handles, &mut self.size_handles);
     }
 
     /// A handle for the descriptor `src` read at `site`.
