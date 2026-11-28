@@ -73,6 +73,9 @@ Title storage is a drive on the console, and titles build paths on that.
 (kernel32 and the C/C++ runtime) and rewrites paths on a virtual drive to
 the host folder behind it; persistent local storage is one such drive over
 a folder under `VICTORY_DATA_DIR`. Other paths reach the host unchanged.
+An open through `CreateFileW` with access exactly `GENERIC_READ` that is
+not overlapped loses `FILE_FLAG_NO_BUFFERING`, so pack reads go through
+the host file cache: a second launch can read them from memory.
 
 An exe's code reaches its static TLS as slot 0; mapped as a DLL it gets
 another slot, so the loader redirects those loads (`victory-loader::tls`).

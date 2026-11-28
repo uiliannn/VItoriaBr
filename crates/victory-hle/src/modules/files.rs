@@ -9,6 +9,11 @@
 //! wide wrapper, which would rewrite the host path a second time when its
 //! drive letter is mounted too. Letters are chosen among those the host
 //! does not use, so no host drive is hidden.
+//!
+//! Beyond paths, one flag changes on the way to the host: an open through
+//! `CreateFileW` with access exactly `GENERIC_READ` that is not overlapped
+//! loses `FILE_FLAG_NO_BUFFERING` (`dropped_flags`), so a title's pack reads
+//! go through the host file cache.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::too_many_arguments)]
@@ -18,8 +23,11 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
+use windows_sys::Win32::Foundation::GENERIC_READ;
 use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
-use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED, GetLogicalDrives,
+};
 
 use crate::{HleExport, HleModule, hle_export};
 
@@ -269,9 +277,28 @@ pub extern "system" fn CreateFileW(
         share,
         security,
         disposition,
-        flags,
+        flags & !dropped_flags(access, flags),
         template,
     )
+}
+
+/// The flags the host's open does not get: an open with `GENERIC_READ` and
+/// no other access loses `FILE_FLAG_NO_BUFFERING`. On the host the flag
+/// keeps every read out of the system file cache, so a title that opens its
+/// packs with it reads the same bytes from the drive on every launch. A
+/// buffered handle returns the same bytes for the same aligned reads; a
+/// read that is not aligned, which an unbuffered handle refuses, succeeds
+/// on it. An overlapped open keeps the flag: the host's `ReadFileScatter`
+/// takes only a handle with both, and a buffered handle may finish an
+/// overlapped read inside the call. Only opens through `CreateFileW`
+/// change: `CreateFile2` keeps its flags (they sit in a structure of the
+/// caller's), and `CreateFileA` passes its flags on as given.
+fn dropped_flags(access: u32, flags: u32) -> u32 {
+    if access == GENERIC_READ && flags & FILE_FLAG_OVERLAPPED == 0 {
+        FILE_FLAG_NO_BUFFERING
+    } else {
+        0
+    }
 }
 
 pub extern "system" fn CreateFileA(
@@ -1000,5 +1027,110 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, ["present.txt"]);
+    }
+
+    /// A file of ten bytes.
+    fn ten_bytes() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        std::fs::write(&path, b"0123456789").unwrap();
+        (dir, path)
+    }
+
+    /// Opens the file of `ten_bytes` with `FILE_FLAG_NO_BUFFERING` and
+    /// reads ten bytes, a length an unbuffered handle refuses; returns the
+    /// bytes read, or `None` if the read failed.
+    fn unaligned_read_of_an_unbuffered_open(access: u32) -> Option<Vec<u8>> {
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, OPEN_EXISTING};
+        let (_dir, path) = ten_bytes();
+        let null = std::ptr::null_mut();
+        unaligned_read(CreateFileW(
+            w(&path.to_string_lossy()).as_ptr(),
+            access,
+            FILE_SHARE_READ,
+            null,
+            OPEN_EXISTING,
+            FILE_FLAG_NO_BUFFERING,
+            null,
+        ))
+    }
+
+    /// Reads ten bytes from `handle` and closes it.
+    fn unaligned_read(handle: Handle) -> Option<Vec<u8>> {
+        assert_ne!(handle as isize, -1);
+        let (mut out, mut n) = ([0u8; 10], 0);
+        let ok = ReadFile(handle, out.as_mut_ptr(), 10, &mut n, std::ptr::null_mut());
+        host!("kernel32.dll", "CloseHandle": extern "system" fn(Handle) -> i32)(handle);
+        (ok != 0).then(|| out[..usize::try_from(n).unwrap()].to_vec())
+    }
+
+    #[test]
+    fn a_read_only_unbuffered_open_accepts_an_unaligned_read() {
+        let read = unaligned_read_of_an_unbuffered_open(GENERIC_READ);
+
+        assert_eq!(read.as_deref(), Some(&b"0123456789"[..]));
+    }
+
+    #[test]
+    fn an_unbuffered_open_by_a_narrow_path_stays_unbuffered() {
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, OPEN_EXISTING};
+        let (_dir, path) = ten_bytes();
+        let narrow_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
+        let null = std::ptr::null_mut();
+
+        let read = unaligned_read(CreateFileA(
+            narrow_path.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ,
+            null,
+            OPEN_EXISTING,
+            FILE_FLAG_NO_BUFFERING,
+            null,
+        ));
+
+        assert_eq!(read, None);
+    }
+
+    #[test]
+    fn an_overlapped_unbuffered_open_stays_unbuffered() {
+        use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, OPEN_EXISTING};
+        use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+        let (_dir, path) = ten_bytes();
+        let null = std::ptr::null_mut();
+        let handle = CreateFileW(
+            w(&path.to_string_lossy()).as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ,
+            null,
+            OPEN_EXISTING,
+            FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED,
+            null,
+        );
+        assert_ne!(handle as isize, -1);
+        let (mut out, mut overlapped, mut n) = ([0u8; 10], OVERLAPPED::default(), 0);
+        let overlapped = &raw mut overlapped;
+
+        // Ten bytes: a length an unbuffered handle refuses.
+        let done = ReadFile(handle, out.as_mut_ptr(), 10, null.cast(), overlapped.cast());
+        let error = std::io::Error::last_os_error().raw_os_error();
+
+        const ERROR_IO_PENDING: i32 = 997;
+        if done != 0 || error == Some(ERROR_IO_PENDING) {
+            // SAFETY: a live handle and the read that started on `overlapped`
+            // (a buffered handle): waited for, so it ends before its buffers go.
+            unsafe { GetOverlappedResult(handle, overlapped, &mut n, 1) };
+        }
+        host!("kernel32.dll", "CloseHandle": extern "system" fn(Handle) -> i32)(handle);
+        assert_eq!((done, error), (0, Some(ERROR_INVALID_PARAMETER as i32)));
+    }
+
+    #[test]
+    fn an_unbuffered_open_for_writing_stays_unbuffered() {
+        use windows_sys::Win32::Foundation::GENERIC_WRITE;
+
+        let read = unaligned_read_of_an_unbuffered_open(GENERIC_READ | GENERIC_WRITE);
+
+        assert_eq!(read, None);
     }
 }
